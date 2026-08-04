@@ -1,0 +1,23 @@
+// The sqlite3 binding for sysl -- a package, in the sense docs/design/packages.md gives the word.
+//
+// This is the first sysl package that lives outside the compiler's own repository, so it is also the
+// first real reader of this file. Only what the compiler reads today is written here: identity, and
+// what the package needs of the machine it is built for. Dependencies are designed and not yet
+// implemented, so there is no `dependencies` block to write.
+
+package {
+  name    = "sqlite3"
+  version = "0.1.0"
+}
+
+// SQLite is a hosted library: it opens files, and on this path it reaches the C runtime for them. A
+// build for a freestanding target has no operating system to do that, and saying so here is what
+// turns "this will not work" into one clean refusal before anything is compiled.
+//
+// `alloc` is deliberately NOT required. The binding makes strings, so it does allocate -- but the
+// requirement a package states is about the *environment*, and a program that cannot allocate will
+// be told so at the construction that needs it, in the module that wrote it, which is a better place
+// than here.
+requires {
+  os = true
+}
