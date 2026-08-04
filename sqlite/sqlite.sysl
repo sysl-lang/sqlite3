@@ -1,5 +1,5 @@
 module sqlite
-link "sqlite3"
+@link("sqlite3")
 
 import sysl.text.{cstring, from_cstring}
 

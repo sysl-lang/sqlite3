@@ -23,7 +23,7 @@ sysl build-lib . -o /tmp/sqlite.syslib
 sysl run yourprogram.sysl --lib /tmp/sqlite.syslib
 ```
 
-**Nothing on the consuming side mentions `-lsqlite3`.** The `link "sqlite3"` directive lives in this
+**Nothing on the consuming side mentions `-lsqlite3`.** The `@link("sqlite3")` annotation lives in this
 library's own header and travels inside the artifact, so a program that links is a program that did
 not have to know what this binds.
 
