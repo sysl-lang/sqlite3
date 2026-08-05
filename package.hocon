@@ -7,7 +7,7 @@
 
 package {
   name    = "sqlite3"
-  version = "0.1.0"
+  version = "0.2.0"
 }
 
 // SQLite is a hosted library: it opens files, and on this path it reaches the C runtime for them. A

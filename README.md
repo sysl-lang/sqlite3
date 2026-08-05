@@ -8,11 +8,15 @@ the library: sysl compiles it as part of the build, so nothing here needs a make
 build script anywhere in this repository.
 
 ```
-sqlite/
+sh/sysl/sqlite/
     sqlite.sysl     the binding
     consts.c        the constants SQLite defines as macros, which a header cannot export
 package.hocon       who this package is, and what it needs of the machine
 ```
+
+The module is **`sh.sysl.sqlite`**, and the three directories are that name: a dotted module name
+mirrors its path from the library root. The prefix is the reverse-DNS of `sysl.sh`, so that a package
+claims a name nobody else will mint rather than the top-level word `sqlite`.
 
 ## Using it
 
@@ -47,7 +51,7 @@ dereference the null pointer SQLite hands back.
 ## Example
 
 ```sysl
-import sqlite.*
+import sh.sysl.sqlite.*
 
 // An in-memory database, so the program leaves nothing behind and needs no writable directory. The
 // name is SQLite's own: it is not a path.
