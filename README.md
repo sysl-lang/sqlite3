@@ -20,7 +20,19 @@ claims a name nobody else will mint rather than the top-level word `sqlite`.
 
 ## Using it
 
-Build the package into an artifact once, then compile against it:
+Name it in your project's `package.hocon` and `sysl build` fetches it:
+
+```hocon
+dependencies {
+  sqlite3 { git = "github.com/sysl-lang/sqlite3", version = "0.2.0" }
+}
+```
+
+The coordinate is an identity rather than a URL, so it carries no `https://`, and `version` is the
+tag `v0.2.0` here. Note that it names the **package**, `sqlite3`, while the module you import is
+`sh.sysl.sqlite` — those are deliberately different things.
+
+Or build the package into an artifact once, then compile against it:
 
 ```
 sysl build-lib . -o /tmp/sqlite.syslib
