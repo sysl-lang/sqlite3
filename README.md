@@ -1,6 +1,6 @@
 # sqlite3
 
-A [sysl](https://github.com/edadma/sysl) binding for SQLite.
+A [sysl](https://github.com/sysl-lang/sysl) binding for SQLite.
 
 The module is `sqlite`, and the directory it lives in is what names it — a module is a directory and
 its name is that directory's path relative to the package root. The C that sits beside it is part of
