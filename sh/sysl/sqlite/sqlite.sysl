@@ -1,7 +1,7 @@
 module sh.sysl.sqlite
 @link("sqlite3")
 
-import sysl.text.{cstring, from_cstring}
+import sysl.text.{cstring, from_cstring, CString}
 
 // SQLite, bound through the C sitting beside this file.
 //
@@ -142,6 +142,60 @@ struct Query
     finalize(self) = c_finalize(self.handle)
 end Query
 
+// A walk over the statements in one piece of SQL, made by `Db.statements`.
+//
+// **It is stepped rather than iterated, and that is deliberate.** A `for` loop iterates a *copy* of
+// its iterator, so a cursor left in the loop would advance the copy and `error` afterwards would
+// read a cursor that never moved -- the same trap `sysl.io.Lines` records about holding its reader
+// by value. Since the whole point of this type is the message it may be carrying when it stops,
+// there is no `Iterate` and a caller writes the `loop`.
+//
+// **Every `Query` it hands back is the caller's to finalize**, exactly as `prepare`'s is. The cursor
+// compiles statements and does not own them; a statement outlives the step that produced it.
+struct Statements
+    db: *Sqlite3
+    // The copy SQLite's tail pointer points into. Held so that it outlives every statement compiled
+    // out of it -- see `Db.statements`.
+    text: CString
+    at: *u8
+    fail: Option[string]
+    done: bool
+
+    // The next statement, or nothing once the text is used up or SQLite has refused it.
+    //
+    // The loop is for text that compiles to *no* statement -- a run of semicolons, trailing
+    // whitespace, a comment at the end -- which SQLite reports as success with a null handle rather
+    // than as an error. That is not the end of the walk, it is a piece of the text with nothing in
+    // it, so the cursor advances past it and asks again.
+    next(*self) -> Option[Query]
+        if self.done then return None
+
+        loop
+            if self.at[0] == 0
+                self.done = true
+                return None
+
+            var stmt: *Stmt
+            var rest: *u8
+
+            if c_prepare(self.db, self.at, -1, &stmt, &rest) != c_ok()
+                self.fail = Some(message(self.db))
+                self.done = true
+                return None
+
+            self.at = rest
+
+            if stmt != null then return Some(Query(stmt, self.db))
+    end next
+
+    // Why the walk stopped, where it stopped because SQLite would not compile what was left.
+    //
+    // It is asked *after* the loop, because a cursor that has run out of text and one that has hit
+    // bad SQL both answer `None` from `next` -- the same shape as reading, and for the same reason:
+    // a caller that does not care should not have to ask.
+    error(self) -> Option[string] = self.fail
+end Statements
+
 // An open database.
 struct Db
     handle: *Sqlite3
@@ -149,8 +203,11 @@ struct Db
     // Compile one SQL statement. The `-1` length tells SQLite the text is NUL-terminated and it
     // should find the end itself, which is what `cstring` has just guaranteed.
     //
-    // The trailing-text out-parameter is passed as null: this binding compiles one statement, and a
-    // caller with several has a loop rather than a pointer to the rest.
+    // **Text holding more than one statement compiles the first and ignores the rest**, which is
+    // SQLite's own behaviour and is why `statements` below exists. The trailing-text out-parameter
+    // is passed as null here because this form has nowhere to put it; a caller with several
+    // statements walks them with the cursor rather than calling this in a loop, since without the
+    // tail there is nothing to advance past what was just compiled.
     //
     // **A successful call is not enough to have a statement.** SQL that holds no statement -- an
     // empty string, or nothing but a comment -- is not an error to SQLite: it succeeds and writes a
@@ -170,9 +227,30 @@ struct Db
             Ok(Query(stmt, self.handle))
     end prepare
 
+    // A walk over every statement in one piece of SQL.
+    //
+    // This is what the trailing-text out-parameter is for, and it is the only way to reach the
+    // second statement in `CREATE TABLE a (x); INSERT INTO a VALUES (1)`: SQLite compiles the first
+    // and hands back a pointer to what is left, so a caller with no way to receive that pointer has
+    // no way to advance and the rest is silently dropped.
+    //
+    // **The cursor owns the copy it points into**, which is the whole reason it is a value rather
+    // than a pair of returns. SQLite's tail points *into* the buffer it was given, so the buffer has
+    // to outlive every statement compiled out of it -- and a `CString` that went out of scope
+    // between two calls would leave the next one reading freed storage.
+    statements(self, sql: string) -> Statements
+        val text = cstring(sql)
+
+        Statements(self.handle, text, text.ptr, None, false)
+    end statements
+
     // Compile and run a statement that returns no rows -- a `CREATE TABLE`, an `INSERT`, a `PRAGMA`.
     // The statement is finalized on every path, including the failing ones, which is the reason to
     // reach for this rather than writing prepare/step/finalize at the call site.
+    //
+    // **One statement**, as the name of what it calls says: text holding several runs the first and
+    // drops the rest, which is SQLite's behaviour and not something this can hide. `exec_all` is the
+    // same thing over a cursor.
     exec(self, sql: string) -> Result[bool, string]
         self.prepare(sql) match
             Ok(q) ->
@@ -183,6 +261,33 @@ struct Db
 
             Err(why) -> Err(why)
     end exec
+
+    // Compile and run every statement in `sql`, answering how many ran.
+    //
+    // It stops at the first failure and reports it, leaving the statements after it uncompiled --
+    // there being no transaction here, what ran has run, and a count that stopped early is the
+    // honest thing to hand back beside the message. Wrap the text in `BEGIN`/`COMMIT` where that is
+    // not what is wanted; SQLite will then undo the rest, and this needs to know nothing about it.
+    exec_all(self, sql: string) -> Result[int, string]
+        var walk = self.statements(sql)
+        var ran = 0
+
+        loop
+            walk.next() match
+                None -> break
+                Some(q) ->
+                    val outcome = q.step()
+
+                    q.finalize()
+
+                    outcome match
+                        Err(why) -> return Err(why)
+                        Ok(_)    -> ran += 1
+
+        walk.error() match
+            Some(why) -> Err(why)
+            None      -> Ok(ran)
+    end exec_all
 
     close(self) = c_close(self.handle)
 end Db

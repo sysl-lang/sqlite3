@@ -10,17 +10,17 @@
 // arrived against `sysl.sum`, and compiles it as more modules.
 //
 //     dependencies {
-//       sqlite3 { git = "github.com/sysl-lang/sqlite3", version = "0.2.0" }
+//       sqlite3 { git = "github.com/sysl-lang/sqlite3", version = "0.3.0" }
 //     }
 //
 // The coordinate is identity rather than a URL, so it carries no `https://`, and the version is the
-// tag `v0.2.0` on this repository. Note that the coordinate names the *package*, `sqlite3`, while the
+// tag `v0.3.0` on this repository. Note that the coordinate names the *package*, `sqlite3`, while the
 // module a program imports is `sh.sysl.sqlite` -- `packages.md § 9` keeps those two deliberately
 // apart. `build-lib` and `--lib` still work, but they are no longer the only way in.
 
 package {
   name    = "sqlite3"
-  version = "0.2.0"
+  version = "0.3.0"
 }
 
 // SQLite is a hosted library: it opens files, and on this path it reaches the C runtime for them. A

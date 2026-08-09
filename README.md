@@ -24,12 +24,12 @@ Name it in your project's `package.hocon` and `sysl build` fetches it:
 
 ```hocon
 dependencies {
-  sqlite3 { git = "github.com/sysl-lang/sqlite3", version = "0.2.0" }
+  sqlite3 { git = "github.com/sysl-lang/sqlite3", version = "0.3.0" }
 }
 ```
 
 The coordinate is an identity rather than a URL, so it carries no `https://`, and `version` is the
-tag `v0.2.0` here. Note that it names the **package**, `sqlite3`, while the module you import is
+tag `v0.3.0` here. Note that it names the **package**, `sqlite3`, while the module you import is
 `sh.sysl.sqlite` — those are deliberately different things.
 
 Or build the package into an artifact once, then compile against it:
@@ -59,6 +59,21 @@ no callback to install, no varargs. That is what makes SQLite a good first bindi
 `NULL` is the case a binding has to have an answer for, and it has one: reading a column that holds
 SQL NULL answers `Ok(None)`, which is not the same answer as a decode failure and does not
 dereference the null pointer SQLite hands back.
+
+**Text holding more than one statement needs `statements` or `exec_all`.** SQLite's `prepare`
+compiles the *first* statement and hands back a pointer to what is left, so `prepare` and `exec` run
+one statement and drop the rest with nothing said — which is SQLite's behaviour and not something a
+binding can hide. `db.statements(sql)` is the cursor over that tail pointer, and `db.exec_all(sql)`
+runs every statement in the text and answers how many ran.
+
+```sysl
+db.exec_all("create table a (x); insert into a values (1)")  // 2
+db.exec("create table a (x); insert into a values (1)")      // the create, and no more
+```
+
+The cursor is stepped rather than iterated, because a `for` loop iterates a *copy* of its iterator
+and the message a failed walk is carrying would then be read off a cursor that never moved. Ask
+`walk.error()` after the loop.
 
 ## Example
 

@@ -1,0 +1,136 @@
+module sh.sysl.sqlite
+@tests
+
+// The binding's own tests, run with `sysl test .` and against a real SQLite.
+//
+// Every one of them opens `:memory:`, which SQLite treats as a private database living for as long
+// as the connection -- so there is no file to clean up and no order dependence between tests.
+
+private fresh() -> Db
+    open(":memory:") match
+        Ok(db)   -> db
+        Err(why) -> panic(f"could not open an in-memory database: ${why}%s")
+
+// The defect this cursor exists for: `prepare` compiles the first statement of a piece of text and
+// SQLite drops the rest with nothing said. That is not a failure and never was -- the tail pointer
+// is how a caller reaches what is left, and the binding used to pass null for it.
+@test("statements walks every statement in one piece of SQL")
+statements_walks_all_of_them()
+    var db = fresh()
+    var walk = db.statements("CREATE TABLE a (x); INSERT INTO a VALUES (1); INSERT INTO a VALUES (2)")
+    var seen = 0
+
+    loop
+        walk.next() match
+            None -> break
+            Some(q) ->
+                q.step()
+                q.finalize()
+                seen += 1
+
+    assert_eq(seen, 3, "three statements were compiled")
+    assert(walk.error().is_none(), "and nothing was wrong with any of them")
+
+    db.close()
+end statements_walks_all_of_them
+
+// The half that says the walk is not merely counting: the second statement has to have *run*, which
+// is what the workaround it replaces could not get to.
+@test("and running them all leaves what all of them did")
+exec_all_runs_all_of_them()
+    var db = fresh()
+
+    assert_eq(db.exec_all("CREATE TABLE a (x); INSERT INTO a VALUES (1); INSERT INTO a VALUES (2)").unwrap(),
+      3, "three statements ran")
+
+    var q = db.prepare("SELECT count(*) FROM a").unwrap()
+
+    assert(q.step().unwrap(), "the count is a row")
+    assert_eq(q.int_at(0), 2, "and both inserts landed")
+
+    q.finalize()
+    db.close()
+end exec_all_runs_all_of_them
+
+// `exec` is unchanged, and this is what pins that: the same text through the one-statement form runs
+// the CREATE and drops both inserts. It is SQLite's behaviour rather than a defect, and it is worth
+// having written down beside the cursor so the difference between the two is a test rather than a
+// sentence in a comment.
+@test("while exec still runs the first statement and no more")
+exec_is_still_one_statement()
+    var db = fresh()
+
+    assert(db.exec("CREATE TABLE a (x); INSERT INTO a VALUES (1)").is_ok(), "the CREATE ran")
+
+    var q = db.prepare("SELECT count(*) FROM a").unwrap()
+
+    assert(q.step().unwrap(), "the count is a row")
+    assert_eq(q.int_at(0), 0, "and the INSERT after the semicolon did not")
+
+    q.finalize()
+    db.close()
+end exec_is_still_one_statement
+
+// Text that compiles to no statement at all is not the end of the walk. SQLite reports a run of
+// semicolons, trailing whitespace or a comment as success with a null handle, which is a piece of
+// text with nothing in it rather than an error -- so the cursor steps past it and asks again.
+@test("empty pieces between statements are stepped over rather than ending the walk")
+statements_skips_the_empty_pieces()
+    var db = fresh()
+
+    assert_eq(db.exec_all("CREATE TABLE a (x);; ; INSERT INTO a VALUES (1); -- and a comment\n").unwrap(),
+      2, "two real statements, and the empty pieces are not counted")
+
+    db.close()
+end statements_skips_the_empty_pieces
+
+// SQL that will not compile stops the walk and the message is asked for afterwards, because a cursor
+// out of text and one that hit bad SQL both answer `None` from `next`.
+@test("bad SQL stops the walk and is reported after it")
+statements_reports_why_it_stopped()
+    var db = fresh()
+    var walk = db.statements("CREATE TABLE a (x); NOT SQL AT ALL")
+    var seen = 0
+
+    loop
+        walk.next() match
+            None -> break
+            Some(q) ->
+                q.step()
+                q.finalize()
+                seen += 1
+
+    assert_eq(seen, 1, "the statement before the mistake compiled")
+    assert(walk.error().is_some(), "and the walk says why it stopped")
+
+    db.close()
+end statements_reports_why_it_stopped
+
+// The count `exec_all` hands back with a failure is what actually ran, which is the honest number:
+// there is no transaction here, so the first statement has run and stays run.
+@test("exec_all stops at the first failure and says so")
+exec_all_stops_at_the_first_failure()
+    var db = fresh()
+
+    assert(db.exec_all("CREATE TABLE a (x); NOT SQL AT ALL; INSERT INTO a VALUES (1)").is_err(),
+      "the mistake is reported")
+
+    var q = db.prepare("SELECT count(*) FROM a").unwrap()
+
+    assert(q.step().unwrap(), "the table was made before the mistake")
+    assert_eq(q.int_at(0), 0, "and nothing after it ran")
+
+    q.finalize()
+    db.close()
+end exec_all_stops_at_the_first_failure
+
+// A single statement through the cursor is one statement, so nothing about the ordinary case moved.
+@test("one statement through the cursor is one statement")
+statements_over_one_statement()
+    var db = fresh()
+
+    assert_eq(db.exec_all("CREATE TABLE a (x)").unwrap(), 1, "one ran")
+    assert_eq(db.exec_all("").unwrap(), 0, "and empty text is a walk over nothing")
+
+    db.close()
+end statements_over_one_statement
