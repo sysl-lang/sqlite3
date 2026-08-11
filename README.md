@@ -9,8 +9,8 @@ build script anywhere in this repository.
 
 ```
 sh/sysl/sqlite/
-    sqlite.sysl     the binding
-    consts.c        the constants SQLite defines as macros, which a header cannot export
+    sqlite.sysl     the binding, and the `c const` block that reads SQLite's macros
+    shim.c          the one call that needs C: `SQLITE_TRANSIENT` is a cast, not a value
 package.hocon       who this package is, and what it needs of the machine
 ```
 

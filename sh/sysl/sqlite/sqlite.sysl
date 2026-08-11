@@ -1,5 +1,6 @@
 module sh.sysl.sqlite
 @link("sqlite3")
+@include("<sqlite3.h>")
 
 import sysl.text.{cstring, from_cstring, CString}
 
@@ -36,14 +37,25 @@ extern "sqlite3_column_name" c_column_name(stmt: *Stmt, col: int) -> *u8
 
 extern "sqlite3_bind_int" c_bind_int(stmt: *Stmt, index: int, value: int) -> int
 
-// The four below are `consts.c`, not SQLite -- see that file for why a `#define` cannot be named by
-// an `extern` and a `SQLITE_TRANSIENT` cannot be spelled at all.
+// The one below is `shim.c`, not SQLite -- see that file for why `SQLITE_TRANSIENT` cannot be
+// spelled here at all.
 extern "sysl_sqlite_bind_text" c_bind_text(stmt: *Stmt, index: int, value: *u8) -> int
-extern "sysl_sqlite_ok" c_ok() -> int
-extern "sysl_sqlite_row" c_row() -> int
-extern "sysl_sqlite_done" c_done() -> int
-extern "sysl_sqlite_open_rw" c_open_rw() -> int
-extern "sysl_sqlite_open_ro" c_open_ro() -> int
+
+// SQLite's result and flag codes, read from the header of the machine being built for.
+//
+// They are `#define`s, so there is no symbol for an `extern` to name -- and until sysl could ask the
+// C compiler for a value, the way to reach one was a function returning it, which meant every
+// comparison below was a call. A constant is what they always were: `OK` may stand in a `match` arm
+// and be folded into a comparison, and neither is something `c_ok()` could ever have done.
+//
+// `OPEN_RW` is the pair a caller almost always wants, and writing it as the `|` of two macros is the
+// point -- the expression is C's, evaluated by C, so nothing here has to know which bits they are.
+c const
+    OK: int      = "SQLITE_OK"
+    ROW: int     = "SQLITE_ROW"
+    DONE: int    = "SQLITE_DONE"
+    OPEN_RW: int = "SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE"
+    OPEN_RO: int = "SQLITE_OPEN_READONLY"
 
 // A prepared statement. The handle is SQLite's storage, so `finalize` is not optional -- this is a C
 // resource, and a binding to a library that allocates has to say who releases it.
@@ -60,9 +72,9 @@ struct Query
     step(self) -> Result[bool, string]
         val code = c_step(self.handle)
 
-        if code == c_row() then
+        if code == ROW then
             Ok(true)
-        else if code == c_done() then
+        else if code == DONE then
             Ok(false)
         else
             Err(message(self.db))
@@ -114,7 +126,7 @@ struct Query
     // SQLite's numbering instead of correcting it, so that a `?` counted in the SQL and an index
     // written here agree without a rule to remember.
     bind_int(self, index: int, value: int) -> Result[Query, string]
-        if c_bind_int(self.handle, index, value) == c_ok() then
+        if c_bind_int(self.handle, index, value) == OK then
             Ok(self)
         else
             Err(message(self.db))
@@ -123,7 +135,7 @@ struct Query
     bind_text(self, index: int, value: string) -> Result[Query, string]
         val text = cstring(value)
 
-        if c_bind_text(self.handle, index, text.ptr) == c_ok() then
+        if c_bind_text(self.handle, index, text.ptr) == OK then
             Ok(self)
         else
             Err(message(self.db))
@@ -133,7 +145,7 @@ struct Query
     // what makes a prepared statement worth preparing: the same `Query` runs again without SQLite
     // parsing the text a second time.
     reset(self) -> Result[Query, string]
-        if c_reset(self.handle) == c_ok() then
+        if c_reset(self.handle) == OK then
             Ok(self)
         else
             Err(message(self.db))
@@ -178,7 +190,7 @@ struct Statements
             var stmt: *Stmt
             var rest: *u8
 
-            if c_prepare(self.db, self.at, -1, &stmt, &rest) != c_ok()
+            if c_prepare(self.db, self.at, -1, &stmt, &rest) != OK
                 self.fail = Some(message(self.db))
                 self.done = true
                 return None
@@ -219,7 +231,7 @@ struct Db
 
         var stmt: *Stmt
 
-        if c_prepare(self.handle, text.ptr, -1, &stmt, null) != c_ok() then
+        if c_prepare(self.handle, text.ptr, -1, &stmt, null) != OK then
             Err(message(self.handle))
         else if stmt == null then
             Err("the SQL holds no statement")
@@ -311,7 +323,7 @@ open(path: string) -> Result[Db, string]
 
     var db: *Sqlite3
 
-    if c_open(name.ptr, &db, c_open_rw(), null) == c_ok() then
+    if c_open(name.ptr, &db, OPEN_RW, null) == OK then
         Ok(Db(db))
     else
         val why = message(db)
@@ -326,7 +338,7 @@ open_readonly(path: string) -> Result[Db, string]
 
     var db: *Sqlite3
 
-    if c_open(name.ptr, &db, c_open_ro(), null) == c_ok() then
+    if c_open(name.ptr, &db, OPEN_RO, null) == OK then
         Ok(Db(db))
     else
         val why = message(db)
