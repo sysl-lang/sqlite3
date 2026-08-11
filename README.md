@@ -24,12 +24,12 @@ Name it in your project's `package.hocon` and `sysl build` fetches it:
 
 ```hocon
 dependencies {
-  sqlite3 { git = "github.com/sysl-lang/sqlite3", version = "0.3.0" }
+  sqlite3 { git = "github.com/sysl-lang/sqlite3", version = "0.4.0" }
 }
 ```
 
 The coordinate is an identity rather than a URL, so it carries no `https://`, and `version` is the
-tag `v0.3.0` here. Note that it names the **package**, `sqlite3`, while the module you import is
+tag `v0.4.0` here. Note that it names the **package**, `sqlite3`, while the module you import is
 `sh.sysl.sqlite` — those are deliberately different things.
 
 Or build the package into an artifact once, then compile against it:
