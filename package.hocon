@@ -27,7 +27,7 @@ package {
 // build for a freestanding target has no operating system to do that, and saying so here is what
 // turns "this will not work" into one clean refusal before anything is compiled.
 //
-// `alloc` is deliberately NOT required. The binding makes strings, so it does allocate -- but the
+// `heap` is deliberately NOT required. The binding makes strings, so it does allocate -- but the
 // requirement a package states is about the *environment*, and a program that cannot allocate will
 // be told so at the construction that needs it, in the module that wrote it, which is a better place
 // than here.
