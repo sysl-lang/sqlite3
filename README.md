@@ -213,3 +213,17 @@ end main
 
 The example lives here rather than in a file of its own because everything under the package root is
 compiled *into* the library, and a library carries no entry point.
+
+## The tests
+
+They run against a real SQLite, so they take the same flag a build does — which is the one thing about
+this package that differs from its siblings:
+
+```
+sysl test . --include-path sqlite3=$(xcrun --show-sdk-path)/usr/include
+```
+
+Nearly all of them open `:memory:`, which SQLite treats as a private database living for as long as the
+connection, so there is no file to clean up and no order dependence between them. The exception is the
+one whose subject is what happens when there is *no* file, and it removes the file first rather than
+trusting the last run to have finished tidily.
