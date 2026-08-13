@@ -10,17 +10,17 @@
 // arrived against `sysl.sum`, and compiles it as more modules.
 //
 //     dependencies {
-//       sqlite3 { git = "github.com/sysl-lang/sqlite3", version = "0.4.0" }
+//       sqlite3 { git = "github.com/sysl-lang/sqlite3", version = "0.5.0" }
 //     }
 //
 // The coordinate is identity rather than a URL, so it carries no `https://`, and the version is the
-// tag `v0.4.0` on this repository. Note that the coordinate names the *package*, `sqlite3`, while the
+// tag `v0.5.0` on this repository. Note that the coordinate names the *package*, `sqlite3`, while the
 // module a program imports is `sh.sysl.sqlite` -- `packages.md § 9` keeps those two deliberately
 // apart. `build-lib` and `--lib` still work, but they are no longer the only way in.
 
 package {
   name    = "sqlite3"
-  version = "0.4.0"
+  version = "0.5.0"
 }
 
 // SQLite is a hosted library: it opens files, and on this path it reaches the C runtime for them. A
@@ -31,6 +31,29 @@ package {
 // requirement a package states is about the *environment*, and a program that cannot allocate will
 // be told so at the construction that needs it, in the module that wrote it, which is a better place
 // than here.
+//
+// **`headers` is the other kind of thing a package can need of its environment.** A capability is
+// answered by the target and there is nothing for anybody to go and do; a header is answered by a
+// path on a machine this package has never seen. `sqlite.sysl` says `@include("<sqlite3.h>")` and no
+// copy of that header is in this repository, so a build has to be told where one is.
+//
+// **It is declared even though macOS already has it**, and that is the whole reason this is worth a
+// paragraph. `sqlite3.h` is in the macOS SDK, on a path clang searches without being asked, so on
+// this machine the flag points at a directory that was already being read. It is not a spare check:
+// a Linux box without `libsqlite3-dev` is the case, and there the refusal arrives before clang and
+// names what to install instead of naming a file that is missing.
+//
+// The check asks what a build *says* it has rather than what it might happen to find, so a bare
+// `--include-path` deliberately does not answer this one -- `packages.md § headers` says why, and it
+// is what stops a declaration from being satisfied by accident on one machine and unenforced on the
+// next. The cost is the flag, on every platform, and it is accepted.
+//
+// A path is not written here. This file is committed and describes the *package*, and where a
+// machine keeps its headers is not a property of the package -- `15 §8` refuses it in as many words,
+// which is the same split `@link("sqlite3")` above draws against `--link-path`.
 requires {
   os = true
+  headers {
+    sqlite3 = "SQLite's own header, which this binding does not carry -- the macOS SDK has it, and a Linux box wants libsqlite3-dev"
+  }
 }

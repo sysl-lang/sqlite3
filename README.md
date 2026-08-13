@@ -24,12 +24,12 @@ Name it in your project's `package.hocon` and `sysl build` fetches it:
 
 ```hocon
 dependencies {
-  sqlite3 { git = "github.com/sysl-lang/sqlite3", version = "0.4.0" }
+  sqlite3 { git = "github.com/sysl-lang/sqlite3", version = "0.5.0" }
 }
 ```
 
 The coordinate is an identity rather than a URL, so it carries no `https://`, and `version` is the
-tag `v0.4.0` here. Note that it names the **package**, `sqlite3`, while the module you import is
+tag `v0.5.0` here. Note that it names the **package**, `sqlite3`, while the module you import is
 `sh.sysl.sqlite` — those are deliberately different things.
 
 Or build the package into an artifact once, then compile against it:
@@ -43,8 +43,35 @@ sysl run yourprogram.sysl --lib /tmp/sqlite.syslib
 library's own header and travels inside the artifact, so a program that links is a program that did
 not have to know what this binds.
 
+## Say where SQLite's header is
+
 You will need SQLite's development files on the machine — `libsqlite3` and its header — since this is
-a binding and not a copy.
+a binding and not a copy. `sqlite.sysl` says `@include("<sqlite3.h>")` and no copy of that header is
+in this repository, so a build has to be told where one is:
+
+```
+sysl build . --include-path sqlite3=$(xcrun --show-sdk-path)/usr/include   # macOS
+sysl build . --include-path sqlite3=/usr/include                           # Linux, after libsqlite3-dev
+```
+
+The name on the left of the `=` is this package's, declared in `package.hocon`, and it is how the
+compiler knows the requirement has been answered. A **bare** `--include-path` reaches clang but does
+not answer it, deliberately — the check asks what a build says it has rather than what it might
+happen to find, so that a declaration cannot be satisfied by accident on one machine and go
+unenforced on the next.
+
+**On macOS that path is one clang already searches**, so the flag looks like ceremony there and is
+not. Without the declaration a Linux box that has no `libsqlite3-dev` finds out from the C compiler:
+
+```
+fatal error: 'sqlite3.h' file not found
+```
+
+which names a file and knows nothing about this package, the flag, or the thing to install. With it,
+the build stops first and says so.
+
+A program reaching this package through a **`.syslib`** needs none of this: an artifact carries the
+compiled shim, so `sysl run yourprogram.sysl --lib /tmp/sqlite.syslib` wants no header and no flag.
 
 ## What it binds
 
