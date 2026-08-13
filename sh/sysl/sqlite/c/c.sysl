@@ -1,0 +1,115 @@
+module sh.sysl.sqlite.c
+@link("sqlite3")
+@include("<sqlite3.h>")
+
+// SQLite as C declares it, and nothing else.
+//
+// This is the whole of the boundary: the library the program links, the header the constants are
+// measured from, the two handles whose shape SQLite never publishes, its result codes, and one
+// `extern` per function. The module above -- `sh.sysl.sqlite` -- is where those turn into something
+// worth calling, and it is the only importer this file expects. Nothing stops a program importing
+// this one, and a program reaching for a corner of SQLite the layer above has not bound yet is
+// exactly who should.
+//
+// **The library is named once, here** (`15 §8`). A program that depends on this package says nothing
+// about linking; the requirement travels in the artifact. The header is likewise named once, and the
+// `c const` block below is measured from whatever it says on the machine being built for -- which is
+// the whole reason the numbers are not written down.
+//
+// SQLite is a good library to see this shape on, because almost nothing crosses the boundary that is
+// not a pointer or an integer: no struct is laid out, no callback is installed, and there are no
+// varargs. What does cross is two handles and a `#define` that is not a value at all, and both have
+// somewhere of their own to go.
+
+// The database connection, and a prepared statement. Both are C's incomplete types -- `sqlite3` and
+// `sqlite3_stmt` are declared and never defined in the header, so a size was never on offer. Written
+// bodyless here, which says exactly that (`15 §9`): only `*Sqlite3` and `*Stmt` may be spoken, and
+// neither can be crossed with the other or with the `*u8` strings declared beside them.
+opaque struct Sqlite3
+opaque struct Stmt
+
+// The flags `open` takes, as the header spells them.
+//
+// **Creating the file is a separate bit from opening it for writing**, which is the distinction the
+// layer above turns into `Access`. A binding that or'd the two together once and offered nothing else
+// -- which this one did until the flags stopped being hard-coded -- cannot open an existing database
+// for writing and fail when it is not there.
+c const
+    OPEN_READONLY: int  = "SQLITE_OPEN_READONLY"
+    OPEN_READWRITE: int = "SQLITE_OPEN_READWRITE"
+    OPEN_CREATE: int    = "SQLITE_OPEN_CREATE"
+
+// SQLite's primary result codes, read from the header of the machine being built for.
+//
+// They are `#define`s, so there is no symbol for an `extern` to name -- and until sysl could ask the
+// C compiler for a value, the way to reach one was a function returning it, which meant every
+// comparison was a call. A constant is what they always were: `ROW` may stand in a `match` arm and be
+// folded into a comparison, and neither is something `c_row()` could ever have done.
+//
+// The whole list is here rather than the three the binding used to compare against, because `Code`
+// above turns them into names a caller can `match` on -- and `BUSY` in particular is the difference
+// between a program that retries and one that reports "database is locked" to somebody who cannot
+// act on it.
+c const
+    OK: int         = "SQLITE_OK"
+    ERROR: int      = "SQLITE_ERROR"
+    INTERNAL: int   = "SQLITE_INTERNAL"
+    PERM: int       = "SQLITE_PERM"
+    ABORT: int      = "SQLITE_ABORT"
+    BUSY: int       = "SQLITE_BUSY"
+    LOCKED: int     = "SQLITE_LOCKED"
+    NOMEM: int      = "SQLITE_NOMEM"
+    READONLY: int   = "SQLITE_READONLY"
+    INTERRUPT: int  = "SQLITE_INTERRUPT"
+    IOERR: int      = "SQLITE_IOERR"
+    CORRUPT: int    = "SQLITE_CORRUPT"
+    NOTFOUND: int   = "SQLITE_NOTFOUND"
+    FULL: int       = "SQLITE_FULL"
+    CANTOPEN: int   = "SQLITE_CANTOPEN"
+    PROTOCOL: int   = "SQLITE_PROTOCOL"
+    EMPTY: int      = "SQLITE_EMPTY"
+    SCHEMA: int     = "SQLITE_SCHEMA"
+    TOOBIG: int     = "SQLITE_TOOBIG"
+    CONSTRAINT: int = "SQLITE_CONSTRAINT"
+    MISMATCH: int   = "SQLITE_MISMATCH"
+    MISUSE: int     = "SQLITE_MISUSE"
+    NOLFS: int      = "SQLITE_NOLFS"
+    AUTH: int       = "SQLITE_AUTH"
+    FORMAT: int     = "SQLITE_FORMAT"
+    RANGE: int      = "SQLITE_RANGE"
+    NOTADB: int     = "SQLITE_NOTADB"
+    NOTICE: int     = "SQLITE_NOTICE"
+    WARNING: int    = "SQLITE_WARNING"
+    ROW: int        = "SQLITE_ROW"
+    DONE: int       = "SQLITE_DONE"
+
+// Opening and closing a connection, and the message the connection is carrying.
+//
+// `errmsg` answers "out of memory" when it is handed a null connection, which is SQLite's own
+// arrangement and is what makes the failing path of `open` safe to write without a null check: an
+// open that failed for want of memory is the one case where there is no handle to ask.
+extern "sqlite3_open_v2" open(path: *u8, db: **Sqlite3, flags: int, vfs: *u8) -> int
+extern "sqlite3_close" close(db: *Sqlite3) -> int
+extern "sqlite3_errmsg" errmsg(db: *Sqlite3) -> *u8
+
+// Compiling a statement, running it, and releasing it. `prepare`'s last parameter is where SQLite
+// writes a pointer to whatever text is left over, which is the only way to reach the second statement
+// in one string.
+extern "sqlite3_prepare_v2" prepare(db: *Sqlite3, sql: *u8, n: int, stmt: **Stmt, tail: **u8) -> int
+extern "sqlite3_step" step(stmt: *Stmt) -> int
+extern "sqlite3_finalize" finalize(stmt: *Stmt) -> int
+extern "sqlite3_reset" reset(stmt: *Stmt) -> int
+
+// Reading the current row. The bytes `column_text` and `column_name` answer are SQLite's own and stay
+// valid only until the next step, so a caller copies them out rather than keeping the pointer.
+extern "sqlite3_column_count" column_count(stmt: *Stmt) -> int
+extern "sqlite3_column_int" column_int(stmt: *Stmt, col: int) -> int
+extern "sqlite3_column_text" column_text(stmt: *Stmt, col: int) -> *u8
+extern "sqlite3_column_name" column_name(stmt: *Stmt, col: int) -> *u8
+
+// Binding a parameter. SQLite numbers them from 1.
+extern "sqlite3_bind_int" bind_int(stmt: *Stmt, index: int, value: int) -> int
+
+// The one below is `shim.c`, not SQLite -- see that file for why `SQLITE_TRANSIENT` cannot be
+// spelled here at all. It is the one thing in the whole binding that C has to do on sysl's behalf.
+extern "sysl_sqlite_bind_text" bind_text(stmt: *Stmt, index: int, value: *u8) -> int

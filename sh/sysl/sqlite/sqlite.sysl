@@ -1,116 +1,324 @@
 module sh.sysl.sqlite
-@link("sqlite3")
-@include("<sqlite3.h>")
 
+import sh.sysl.sqlite.c
 import sysl.text.{cstring, from_cstring, CString}
 
-// SQLite, bound through the C sitting beside this file.
+// SQLite, bound in two layers: `sh.sysl.sqlite.c` beside this file is the boundary as C declares it,
+// and this is what a program calls.
 //
-// The library is a good first binding because almost nothing crosses the boundary that is not a
-// pointer or an integer: there is no struct to lay out, no callback to install, and no varargs. What
-// does cross is two handles whose shape SQLite never publishes, and `opaque struct` (`15 §9`) is how
-// that is said -- `*Sqlite3` and `*Stmt` get types of their own, so neither can be crossed with the
-// other or with the `*u8` strings declared beside them.
+// **Nothing here has to be released by hand.** A connection and a statement are both C's storage, and
+// both are `&`-held objects with destructors -- so `open` hands back a `&Db` that closes when the last
+// reference to it goes, and `prepare` a `&Query` that finalizes the same way. There is no `close` and
+// no `finalize` in this API, which is the point: they were the two calls a program could forget.
 //
-// The library it needs is named once, in the header above (`15 §8`). A program that depends on this
-// one says nothing about linking; the requirement travels in the artifact.
-
-// The database connection, and a prepared statement. Both are C's incomplete types -- `sqlite3` and
-// `sqlite3_stmt` are declared and never defined in the header, so a size was never on offer. Written
-// bodyless here, which says exactly that: only `*Sqlite3` and `*Stmt` may be spoken.
-opaque struct Sqlite3
-opaque struct Stmt
-
-extern "sqlite3_open_v2" c_open(path: *u8, db: **Sqlite3, flags: int, vfs: *u8) -> int
-extern "sqlite3_close" c_close(db: *Sqlite3) -> int
-extern "sqlite3_errmsg" c_errmsg(db: *Sqlite3) -> *u8
-
-extern "sqlite3_prepare_v2" c_prepare(db: *Sqlite3, sql: *u8, n: int, stmt: **Stmt, tail: **u8) -> int
-extern "sqlite3_step" c_step(stmt: *Stmt) -> int
-extern "sqlite3_finalize" c_finalize(stmt: *Stmt) -> int
-extern "sqlite3_reset" c_reset(stmt: *Stmt) -> int
-
-extern "sqlite3_column_count" c_column_count(stmt: *Stmt) -> int
-extern "sqlite3_column_int" c_column_int(stmt: *Stmt, col: int) -> int
-extern "sqlite3_column_text" c_column_text(stmt: *Stmt, col: int) -> *u8
-extern "sqlite3_column_name" c_column_name(stmt: *Stmt, col: int) -> *u8
-
-extern "sqlite3_bind_int" c_bind_int(stmt: *Stmt, index: int, value: int) -> int
-
-// The one below is `shim.c`, not SQLite -- see that file for why `SQLITE_TRANSIENT` cannot be
-// spelled here at all.
-extern "sysl_sqlite_bind_text" c_bind_text(stmt: *Stmt, index: int, value: *u8) -> int
-
-// SQLite's result and flag codes, read from the header of the machine being built for.
+// **The order the two happen in is SQLite's rule, and it is the type that keeps it.** `sqlite3_close`
+// on a connection with a live statement answers `SQLITE_BUSY` and closes nothing, so a statement has
+// to be finalized first. A `Query` therefore holds a reference to the `Db` it was compiled by, which
+// means the connection cannot be destroyed while any statement from it is alive -- the last `Query`
+// goes, and the `Db` goes after it. A program that returns a statement from the function that opened
+// the database is doing something that used to be a mistake and now simply works.
 //
-// They are `#define`s, so there is no symbol for an `extern` to name -- and until sysl could ask the
-// C compiler for a value, the way to reach one was a function returning it, which meant every
-// comparison below was a call. A constant is what they always were: `OK` may stand in a `match` arm
-// and be folded into a comparison, and neither is something `c_ok()` could ever have done.
+// **The failure that field prevents is a LEAK rather than a use-after-free**, which is worth stating
+// because it is the quieter of the two. Were the reference not held, the connection would be closed
+// while a statement was live, SQLite would refuse -- so the statement would go on working, the
+// connection would stay open for the life of the process, and nothing would say a word.
 //
-// `OPEN_RW` is the pair a caller almost always wants, and writing it as the `|` of two macros is the
-// point -- the expression is C's, evaluated by C, so nothing here has to know which bits they are.
-c const
-    OK: int      = "SQLITE_OK"
-    ROW: int     = "SQLITE_ROW"
-    DONE: int    = "SQLITE_DONE"
-    OPEN_RW: int = "SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE"
-    OPEN_RO: int = "SQLITE_OPEN_READONLY"
+// That is also why the destructor calls `sqlite3_close` rather than `sqlite3_close_v2`. SQLite offers
+// the second one for languages whose destructors run in an order nobody controls; sysl's run in the
+// order the references go, so the stricter call is the correct one and its refusal is unreachable.
+//
+// ==What a program looks like==
+//
+//     val db = open("notes.db")?
+//
+//     db.exec("CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, body TEXT)")?
+//
+//     val add = db.prepare("INSERT INTO notes (body) VALUES (?)")?
+//
+//     add.bind_text(1, "the first one")?
+//     add.step()?
+//
+// The library it links is named once, in `c/c.sysl`, and the header it measures SQLite's codes from is
+// named there too. A program depending on this package says nothing about either.
 
-// A prepared statement. The handle is SQLite's storage, so `finalize` is not optional -- this is a C
-// resource, and a binding to a library that allocates has to say who releases it.
-struct Query
-    handle: *Stmt
-    db: *Sqlite3
+// SQLite's primary result codes, as names to match on.
+//
+// **This is what a failure is worth reporting as.** `Busy` is a lock somebody else holds and a caller
+// can wait and try again; `Constraint` is data the schema refused and no amount of waiting fixes it;
+// `ReadOnly` is a mistake about the connection rather than about the SQL. A binding that answered only
+// SQLite's English sentence would leave a caller matching on the text of "database is locked" to tell
+// those apart.
+//
+// **Two variants are not spelled as the header spells them, and `name` gives the header's word for
+// both.** `SQLITE_OK` is `Success` because `Ok` is already `Result`'s, and `SQLITE_ERROR` is `Failed`
+// because `Error` is the struct below -- taking either name would shadow something a caller uses in
+// the same breath.
+//
+// **These are the primary codes.** SQLite can report an extended code -- a primary code with more in
+// the high bits -- once a connection is asked to, which this binding does not ask for and does not
+// bind; such a code arrives here as `Unknown` with the number intact in `Error.code`.
+enum Code
+    // `SQLITE_OK`. Not something an `Error` carries: it is what the absence of one answers.
+    Success
+    // `SQLITE_ERROR`. The unspecific one, and the most common: SQL that will not compile arrives as
+    // this, with the interesting part in the message.
+    Failed
+    Internal
+    Perm
+    Abort
+    // Another connection holds a lock on the database. The one failure here that is worth retrying
+    // rather than reporting.
+    Busy
+    // A table in this same connection is locked -- a different thing from `Busy`, and not fixed by
+    // waiting, since the connection holding it is the one asking.
+    Locked
+    NoMem
+    // A write was attempted on a connection opened `ReadOnly`, or on a database the file system will
+    // not let this process write.
+    ReadOnly
+    Interrupt
+    // The file system refused, and the message says how.
+    IoErr
+    Corrupt
+    NotFound
+    // The disk, or the database's own size limit, is full.
+    Full
+    // The file could not be opened: it is not there and nothing asked for it to be created, or the
+    // directory holding it is not writable.
+    CantOpen
+    Protocol
+    Empty
+    Schema
+    TooBig
+    // A constraint the schema declares was violated -- a duplicate primary key, a `NOT NULL` left
+    // null, a failing `CHECK`.
+    Constraint
+    // A value's type is not one the column or the operation accepts.
+    Mismatch
+    // The library was used in a way its interface does not allow, which is a defect in the calling
+    // program rather than a condition it can handle.
+    Misuse
+    NoLfs
+    Auth
+    Format
+    // A bound parameter's index is outside the range the statement has.
+    Range
+    // The file is not a database, or is encrypted with a key this build has no way to use.
+    NotADb
+    Notice
+    Warning
+    // `SQLITE_ROW` -- a row is ready to be read. `Query.step` turns this into `Ok(true)` and a caller
+    // does not usually meet it.
+    Row
+    // `SQLITE_DONE` -- the statement has run to completion. `Query.step` answers `Ok(false)`.
+    Done
+    // Not SQLite's at all: the objection is this binding's. There are two, and both are cases where
+    // SQLite reported success and handed over something a caller cannot use -- text that compiled to
+    // no statement, and a text column whose bytes are not UTF-8.
+    NotSqlite
+    // A code this binding does not name, which is what a newer SQLite or an extended result code
+    // arrives as. `Error.code` still carries the number.
+    Unknown
 
-    // Advance to the next row. `true` means a row is available to read, `false` that the statement
-    // has run to completion -- so the natural shape at a call site is a loop that ends on `false`.
+    // Which code a number is. **This travels one way only** -- SQLite answers a number and nothing
+    // here ever needs to send one -- so there is no `code` going the other way, and an unnamed number
+    // is `Unknown` rather than a trap.
+    of(code: int) -> Code = code match
+        c.OK         -> Success
+        c.ERROR      -> Failed
+        c.INTERNAL   -> Internal
+        c.PERM       -> Perm
+        c.ABORT      -> Abort
+        c.BUSY       -> Busy
+        c.LOCKED     -> Locked
+        c.NOMEM      -> NoMem
+        c.READONLY   -> ReadOnly
+        c.INTERRUPT  -> Interrupt
+        c.IOERR      -> IoErr
+        c.CORRUPT    -> Corrupt
+        c.NOTFOUND   -> NotFound
+        c.FULL       -> Full
+        c.CANTOPEN   -> CantOpen
+        c.PROTOCOL   -> Protocol
+        c.EMPTY      -> Empty
+        c.SCHEMA     -> Schema
+        c.TOOBIG     -> TooBig
+        c.CONSTRAINT -> Constraint
+        c.MISMATCH   -> Mismatch
+        c.MISUSE     -> Misuse
+        c.NOLFS      -> NoLfs
+        c.AUTH       -> Auth
+        c.FORMAT     -> Format
+        c.RANGE      -> Range
+        c.NOTADB     -> NotADb
+        c.NOTICE     -> Notice
+        c.WARNING    -> Warning
+        c.ROW        -> Row
+        c.DONE       -> Done
+        NOT_SQLITE   -> NotSqlite
+        _            -> Unknown
+
+    // The header's own word for this code, for a program that logs one. `NotSqlite` and `Unknown` are
+    // the two with nothing in the header to name.
+    name(self) -> string = self match
+        Success    -> "SQLITE_OK"
+        Failed     -> "SQLITE_ERROR"
+        Internal   -> "SQLITE_INTERNAL"
+        Perm       -> "SQLITE_PERM"
+        Abort      -> "SQLITE_ABORT"
+        Busy       -> "SQLITE_BUSY"
+        Locked     -> "SQLITE_LOCKED"
+        NoMem      -> "SQLITE_NOMEM"
+        ReadOnly   -> "SQLITE_READONLY"
+        Interrupt  -> "SQLITE_INTERRUPT"
+        IoErr      -> "SQLITE_IOERR"
+        Corrupt    -> "SQLITE_CORRUPT"
+        NotFound   -> "SQLITE_NOTFOUND"
+        Full       -> "SQLITE_FULL"
+        CantOpen   -> "SQLITE_CANTOPEN"
+        Protocol   -> "SQLITE_PROTOCOL"
+        Empty      -> "SQLITE_EMPTY"
+        Schema     -> "SQLITE_SCHEMA"
+        TooBig     -> "SQLITE_TOOBIG"
+        Constraint -> "SQLITE_CONSTRAINT"
+        Mismatch   -> "SQLITE_MISMATCH"
+        Misuse     -> "SQLITE_MISUSE"
+        NoLfs      -> "SQLITE_NOLFS"
+        Auth       -> "SQLITE_AUTH"
+        Format     -> "SQLITE_FORMAT"
+        Range      -> "SQLITE_RANGE"
+        NotADb     -> "SQLITE_NOTADB"
+        Notice     -> "SQLITE_NOTICE"
+        Warning    -> "SQLITE_WARNING"
+        Row        -> "SQLITE_ROW"
+        Done       -> "SQLITE_DONE"
+        NotSqlite  -> "not a SQLite code"
+        Unknown    -> "an unrecognized SQLite code"
+end Code
+
+impl Display for Code
+    display(self, out: *Writer, fmt: FormatSpec) = display_str(self.name(), out, fmt)
+
+// The `code` an `Error` carries where the objection is this binding's own rather than the database's.
+//
+// SQLite's codes are all non-negative, so nothing it can answer collides with this. It exists so that
+// there is one error type in the API and `?` composes across all of it -- a second type for the two
+// failures SQLite has no opinion about would have to be unwrapped and rewrapped at every call site
+// that met both.
+const NOT_SQLITE: int = -1
+
+// What went wrong.
+struct Error
+    // SQLite's own result code, or `NOT_SQLITE`. Kept as the number rather than as a `Code` so that a
+    // code this binding does not name survives being reported.
+    code: int
+
+    // The sentence to show a person.
     //
-    // Any other code is the error path, and it is reported with SQLite's own message rather than the
-    // number: `step` fails for reasons a caller can act on, and "database is locked" is worth more
-    // than 5.
-    step(self) -> Result[bool, string]
-        val code = c_step(self.handle)
+    // **It is captured when the error is made, not read when the error is read.** SQLite's message
+    // belongs to the *connection* and the next failure on it overwrites the bytes, so an error that
+    // fetched its own text lazily would report whatever went wrong most recently instead.
+    message: string
 
-        if code == ROW then
-            Ok(true)
-        else if code == DONE then
-            Ok(false)
-        else
-            Err(message(self.db))
+    kind(self) -> Code = Code.of(self.code)
+end Error
+
+// An `Error` renders as SQLite's own sentence, so `f"${err}"` and a `main` that results in one both
+// say something a reader can act on rather than a number.
+impl Display for Error
+    display(self, out: *Writer, fmt: FormatSpec) = display_str(self.message, out, fmt)
+
+// How a database is to be opened.
+//
+// **`Write` is the reason this is an enum rather than the two functions it replaces.** Creating the
+// file and opening it for writing are separate flags in the header, and a binding that or'd them
+// together once -- which this one did, while the numbers were still hard-coded C -- offers no way to
+// say "write to the database that is there, and tell me if it is not".
+//
+// The three are named for the intention rather than for the flags, which is also what keeps `Read`
+// from colliding with `Code.ReadOnly`: an access mode and a result code are different things and a
+// caller meets both in the same breath.
+enum Access
+    // Read and write, creating the database when there is no file. What `open` asks for, and what an
+    // application usually wants.
+    Create
+    // Read and write a database that is already there, failing with `CantOpen` when it is not. The
+    // form to reach for where a missing file is a mistake rather than a first run.
+    Write
+    // Read only, failing with `CantOpen` when there is no file. Writing through such a connection
+    // fails with `Code.ReadOnly`.
+    Read
+
+    // The `flags` value `sqlite3_open_v2` is given. Each name is the header's own, asked for through
+    // `c const` rather than written here as a number.
+    code(self) -> int = self match
+        Create -> c.OPEN_READWRITE | c.OPEN_CREATE
+        Write  -> c.OPEN_READWRITE
+        Read   -> c.OPEN_READONLY
+end Access
+
+// A prepared statement.
+//
+// The handle is SQLite's storage and the destructor below releases it, so nothing has to be finalized
+// by hand -- and because the statement holds the connection it came from, nothing can be finalized too
+// late either.
+struct Query
+    handle: *c.Stmt
+
+    // The connection that compiled this statement, held rather than borrowed. **This field is the
+    // whole of the ordering guarantee**: while a `Query` is alive its `Db` has a reference and cannot
+    // be closed, so `sqlite3_close` never meets a statement it would have to refuse.
+    //
+    // It is public because it is the answer to "which database is this statement against", which a
+    // program holding several connections has to be able to ask.
+    db: &Db
+
+    // Advance to the next row. `true` means a row is available to read, `false` that the statement has
+    // run to completion -- so the natural shape at a call site is a loop that ends on `false`.
+    //
+    // Anything else is the error path, reported with SQLite's code *and* its message: `Busy` is worth
+    // retrying, `Constraint` is not, and "database is locked" is worth more than 5.
+    step(&self) -> Result[bool, Error]
+        val code = c.step(self.handle)
+
+        code match
+            c.ROW  -> Ok(true)
+            c.DONE -> Ok(false)
+            _      -> Err(failure(self.db.handle, code))
     end step
 
     // The columns of the current row, by position. These are only meaningful after `step` answered
     // `true`, which is SQLite's rule rather than this binding's.
-    int_at(self, col: int) -> int = c_column_int(self.handle, col)
+    int_at(&self, col: int) -> int = c.column_int(self.handle, col)
 
     // A text column. Two things can be wrong with one and they are different, so the type says both:
-    // `Ok(None)` is SQL NULL, and `Err` is a value whose bytes are not UTF-8.
+    // `Ok(None)` is SQL NULL, and `Err` is a value whose bytes are not UTF-8 -- the second carrying
+    // `NotSqlite`, because SQLite raised nothing and would hand the same bytes over again.
     //
     // **The null check must come first.** `sqlite3_column_text` signals SQL NULL by returning a null
-    // pointer, and `from_cstring` walks the bytes looking for a terminator without testing the
-    // pointer it was given -- so handing it a NULL column would read address zero. That is a property
-    // of the two functions meeting, not a bug in either.
+    // pointer, and `from_cstring` walks the bytes looking for a terminator without testing the pointer
+    // it was given -- so handing it a NULL column would read address zero. That is a property of the
+    // two functions meeting, not a bug in either.
     //
     // The bytes are SQLite's and stay valid only until the next `step`, so `from_cstring` copies them
     // out here rather than handing back a pointer that is about to move.
-    text_at(self, col: int) -> Result[Option[string], string]
-        val p = c_column_text(self.handle, col)
+    text_at(&self, col: int) -> Result[Option[string], Error]
+        val p = c.column_text(self.handle, col)
 
         if p == null then
             Ok(None)
         else
             from_cstring(p) match
                 Ok(s)  -> Ok(Some(s))
-                Err(_) -> Err("a text column held bytes that are not valid UTF-8")
+                Err(_) -> Err(Error(NOT_SQLITE, "a text column held bytes that are not valid UTF-8"))
     end text_at
 
-    // The column's name as the statement declares it, for callers reading a row whose SQL they did
-    // not write. Absent when SQLite cannot supply one -- and, unlike a value, a name that will not
-    // decode is not worth distinguishing: it came from SQL the caller compiled, so bytes that are not
-    // UTF-8 there mean the same thing to them as no name at all.
-    name_at(self, col: int) -> Option[string]
-        val p = c_column_name(self.handle, col)
+    // The column's name as the statement declares it, for callers reading a row whose SQL they did not
+    // write. Absent when SQLite cannot supply one -- and, unlike a value, a name that will not decode
+    // is not worth distinguishing: it came from SQL the caller compiled, so bytes that are not UTF-8
+    // there mean the same thing to them as no name at all.
+    name_at(&self, col: int) -> Option[string]
+        val p = c.column_name(self.handle, col)
 
         if p == null then
             None
@@ -120,66 +328,80 @@ struct Query
                 Err(_) -> None
     end name_at
 
-    columns(self) -> int = c_column_count(self.handle)
+    columns(&self) -> int = c.column_count(self.handle)
 
     // Parameters are bound by index, and SQLite numbers them from 1 rather than 0. The binding keeps
     // SQLite's numbering instead of correcting it, so that a `?` counted in the SQL and an index
     // written here agree without a rule to remember.
-    bind_int(self, index: int, value: int) -> Result[Query, string]
-        if c_bind_int(self.handle, index, value) == OK then
+    //
+    // The statement itself comes back, so bindings chain: `q.bind_int(1, 7)?.step()`.
+    bind_int(&self, index: int, value: int) -> Result[&Query, Error]
+        val code = c.bind_int(self.handle, index, value)
+
+        if code == c.OK then
             Ok(self)
         else
-            Err(message(self.db))
+            Err(failure(self.db.handle, code))
     end bind_int
 
-    bind_text(self, index: int, value: string) -> Result[Query, string]
+    bind_text(&self, index: int, value: string) -> Result[&Query, Error]
         val text = cstring(value)
+        val code = c.bind_text(self.handle, index, text.ptr)
 
-        if c_bind_text(self.handle, index, text.ptr) == OK then
+        if code == c.OK then
             Ok(self)
         else
-            Err(message(self.db))
+            Err(failure(self.db.handle, code))
     end bind_text
 
     // Return the statement to its unstepped state, keeping the compiled SQL and its bindings. This is
     // what makes a prepared statement worth preparing: the same `Query` runs again without SQLite
     // parsing the text a second time.
-    reset(self) -> Result[Query, string]
-        if c_reset(self.handle) == OK then
+    reset(&self) -> Result[&Query, Error]
+        val code = c.reset(self.handle)
+
+        if code == c.OK then
             Ok(self)
         else
-            Err(message(self.db))
+            Err(failure(self.db.handle, code))
     end reset
-
-    finalize(self) = c_finalize(self.handle)
 end Query
+
+// The statement goes when the last reference to it does, and the connection it holds only afterwards.
+impl Drop for Query
+    drop(self)
+        c.finalize(self.handle)
+    end drop
 
 // A walk over the statements in one piece of SQL, made by `Db.statements`.
 //
-// **It is stepped rather than iterated, and that is deliberate.** A `for` loop iterates a *copy* of
-// its iterator, so a cursor left in the loop would advance the copy and `error` afterwards would
-// read a cursor that never moved -- the same trap `sysl.io.Lines` records about holding its reader
-// by value. Since the whole point of this type is the message it may be carrying when it stops,
-// there is no `Iterate` and a caller writes the `loop`.
+// **It is stepped rather than iterated, and that is deliberate.** A `for` loop iterates a *copy* of its
+// iterator, so a cursor left in the loop would advance the copy and `error` afterwards would read a
+// cursor that never moved -- the same trap `sysl.io.Lines` records about holding its reader by value.
+// Since the whole point of this type is the message it may be carrying when it stops, there is no
+// `Iterate` and a caller writes the `loop`.
 //
-// **Every `Query` it hands back is the caller's to finalize**, exactly as `prepare`'s is. The cursor
-// compiles statements and does not own them; a statement outlives the step that produced it.
+// Every `Query` it hands back finalizes itself, so a loop that drops each one as it goes releases each
+// statement at the end of its iteration and nothing accumulates.
 struct Statements
-    db: *Sqlite3
+    // The connection, held for the same reason a `Query` holds it: the statements this cursor is about
+    // to compile must not outlive it, and the reference is what says so.
+    db: &Db
+
     // The copy SQLite's tail pointer points into. Held so that it outlives every statement compiled
     // out of it -- see `Db.statements`.
     text: CString
     at: *u8
-    fail: Option[string]
+    fail: Option[Error]
     done: bool
 
     // The next statement, or nothing once the text is used up or SQLite has refused it.
     //
     // The loop is for text that compiles to *no* statement -- a run of semicolons, trailing
     // whitespace, a comment at the end -- which SQLite reports as success with a null handle rather
-    // than as an error. That is not the end of the walk, it is a piece of the text with nothing in
-    // it, so the cursor advances past it and asks again.
-    next(*self) -> Option[Query]
+    // than as an error. That is not the end of the walk, it is a piece of the text with nothing in it,
+    // so the cursor advances past it and asks again.
+    next(*self) -> Option[&Query]
         if self.done then return None
 
         loop
@@ -187,11 +409,13 @@ struct Statements
                 self.done = true
                 return None
 
-            var stmt: *Stmt
+            var stmt: *c.Stmt
             var rest: *u8
 
-            if c_prepare(self.db, self.at, -1, &stmt, &rest) != OK
-                self.fail = Some(message(self.db))
+            val code = c.prepare(self.db.handle, self.at, -1, &stmt, &rest)
+
+            if code != c.OK
+                self.fail = Some(failure(self.db.handle, code))
                 self.done = true
                 return None
 
@@ -202,85 +426,81 @@ struct Statements
 
     // Why the walk stopped, where it stopped because SQLite would not compile what was left.
     //
-    // It is asked *after* the loop, because a cursor that has run out of text and one that has hit
-    // bad SQL both answer `None` from `next` -- the same shape as reading, and for the same reason:
-    // a caller that does not care should not have to ask.
-    error(self) -> Option[string] = self.fail
+    // It is asked *after* the loop, because a cursor that has run out of text and one that has hit bad
+    // SQL both answer `None` from `next` -- the same shape as reading, and for the same reason: a
+    // caller that does not care should not have to ask.
+    error(self) -> Option[Error] = self.fail
 end Statements
 
 // An open database.
 struct Db
-    handle: *Sqlite3
+    handle: *c.Sqlite3
 
-    // Compile one SQL statement. The `-1` length tells SQLite the text is NUL-terminated and it
-    // should find the end itself, which is what `cstring` has just guaranteed.
+    // Compile one SQL statement. The `-1` length tells SQLite the text is NUL-terminated and it should
+    // find the end itself, which is what `cstring` has just guaranteed.
     //
     // **Text holding more than one statement compiles the first and ignores the rest**, which is
-    // SQLite's own behaviour and is why `statements` below exists. The trailing-text out-parameter
-    // is passed as null here because this form has nowhere to put it; a caller with several
-    // statements walks them with the cursor rather than calling this in a loop, since without the
-    // tail there is nothing to advance past what was just compiled.
+    // SQLite's own behaviour and is why `statements` below exists. The trailing-text out-parameter is
+    // passed as null here because this form has nowhere to put it; a caller with several statements
+    // walks them with the cursor rather than calling this in a loop, since without the tail there is
+    // nothing to advance past what was just compiled.
     //
-    // **A successful call is not enough to have a statement.** SQL that holds no statement -- an
-    // empty string, or nothing but a comment -- is not an error to SQLite: it succeeds and writes a
-    // null handle, meaning "there was nothing here to compile". Answering `Ok` with that would hand
-    // back a `Query` whose every method is a call on a null pointer, and the caller asked for a
-    // statement, so the honest answer is that there is not one.
-    prepare(self, sql: string) -> Result[Query, string]
+    // **A successful call is not enough to have a statement.** SQL that holds no statement -- an empty
+    // string, or nothing but a comment -- is not an error to SQLite: it succeeds and writes a null
+    // handle, meaning "there was nothing here to compile". Answering `Ok` with that would hand back a
+    // `Query` whose every method is a call on a null pointer, and the caller asked for a statement, so
+    // the honest answer is that there is not one. It is a `NotSqlite` error, since SQLite did not
+    // object.
+    prepare(&self, sql: string) -> Result[&Query, Error]
         val text = cstring(sql)
 
-        var stmt: *Stmt
+        var stmt: *c.Stmt
 
-        if c_prepare(self.handle, text.ptr, -1, &stmt, null) != OK then
-            Err(message(self.handle))
+        val code = c.prepare(self.handle, text.ptr, -1, &stmt, null)
+
+        if code != c.OK then
+            Err(failure(self.handle, code))
         else if stmt == null then
-            Err("the SQL holds no statement")
+            Err(Error(NOT_SQLITE, "the SQL holds no statement"))
         else
-            Ok(Query(stmt, self.handle))
+            Ok(Query(stmt, self))
     end prepare
 
     // A walk over every statement in one piece of SQL.
     //
-    // This is what the trailing-text out-parameter is for, and it is the only way to reach the
-    // second statement in `CREATE TABLE a (x); INSERT INTO a VALUES (1)`: SQLite compiles the first
-    // and hands back a pointer to what is left, so a caller with no way to receive that pointer has
-    // no way to advance and the rest is silently dropped.
+    // This is what the trailing-text out-parameter is for, and it is the only way to reach the second
+    // statement in `CREATE TABLE a (x); INSERT INTO a VALUES (1)`: SQLite compiles the first and hands
+    // back a pointer to what is left, so a caller with no way to receive that pointer has no way to
+    // advance and the rest is silently dropped.
     //
-    // **The cursor owns the copy it points into**, which is the whole reason it is a value rather
-    // than a pair of returns. SQLite's tail points *into* the buffer it was given, so the buffer has
-    // to outlive every statement compiled out of it -- and a `CString` that went out of scope
-    // between two calls would leave the next one reading freed storage.
-    statements(self, sql: string) -> Statements
+    // **The cursor owns the copy it points into**, which is the whole reason it is a value rather than
+    // a pair of returns. SQLite's tail points *into* the buffer it was given, so the buffer has to
+    // outlive every statement compiled out of it -- and a `CString` that went out of scope between two
+    // calls would leave the next one reading freed storage.
+    statements(&self, sql: string) -> Statements
         val text = cstring(sql)
 
-        Statements(self.handle, text, text.ptr, None, false)
+        Statements(self, text, text.ptr, None, false)
     end statements
 
     // Compile and run a statement that returns no rows -- a `CREATE TABLE`, an `INSERT`, a `PRAGMA`.
-    // The statement is finalized on every path, including the failing ones, which is the reason to
-    // reach for this rather than writing prepare/step/finalize at the call site.
     //
     // **One statement**, as the name of what it calls says: text holding several runs the first and
     // drops the rest, which is SQLite's behaviour and not something this can hide. `exec_all` is the
     // same thing over a cursor.
-    exec(self, sql: string) -> Result[bool, string]
-        self.prepare(sql) match
-            Ok(q) ->
-                val outcome = q.step()
-
-                q.finalize()
-                outcome
-
-            Err(why) -> Err(why)
-    end exec
+    //
+    // The statement is released on every path including the failing ones, and there is nothing here
+    // that does it: the `Query` is a local, so it finalizes when this returns. Written by hand, this
+    // was the shape a `finalize` went missing from.
+    exec(&self, sql: string) -> Result[bool, Error] = self.prepare(sql)?.step()
 
     // Compile and run every statement in `sql`, answering how many ran.
     //
-    // It stops at the first failure and reports it, leaving the statements after it uncompiled --
-    // there being no transaction here, what ran has run, and a count that stopped early is the
-    // honest thing to hand back beside the message. Wrap the text in `BEGIN`/`COMMIT` where that is
-    // not what is wanted; SQLite will then undo the rest, and this needs to know nothing about it.
-    exec_all(self, sql: string) -> Result[int, string]
+    // It stops at the first failure and reports it, leaving the statements after it uncompiled -- there
+    // being no transaction here, what ran has run, and a count that stopped early is the honest thing
+    // to hand back beside the message. Wrap the text in `BEGIN`/`COMMIT` where that is not what is
+    // wanted; SQLite will then undo the rest, and this needs to know nothing about it.
+    exec_all(&self, sql: string) -> Result[int, Error]
         var walk = self.statements(sql)
         var ran = 0
 
@@ -288,11 +508,7 @@ struct Db
             walk.next() match
                 None -> break
                 Some(q) ->
-                    val outcome = q.step()
-
-                    q.finalize()
-
-                    outcome match
+                    q.step() match
                         Err(why) -> return Err(why)
                         Ok(_)    -> ran += 1
 
@@ -300,49 +516,56 @@ struct Db
             Some(why) -> Err(why)
             None      -> Ok(ran)
     end exec_all
-
-    close(self) = c_close(self.handle)
 end Db
 
-// The message SQLite itself supplies for the most recent failure on this connection. Falling back to
-// a fixed string keeps the signature honest when even the message cannot be read.
-message(db: *Sqlite3) -> string =
-    from_cstring(c_errmsg(db)).unwrap_or("the database reported an error it could not describe")
+// The connection closes when the last reference to it goes -- which, by the field a `Query` carries,
+// is after the last statement compiled from it has been finalized.
+//
+// `sqlite3_close`'s own result is discarded because there is nothing it can be here. It answers
+// `SQLITE_BUSY` where a statement is still live, and that is exactly the state the reference makes
+// unreachable.
+impl Drop for Db
+    drop(self)
+        c.close(self.handle)
+    end drop
+
+// The error SQLite is carrying on this connection, as a code and the sentence that goes with it.
+private failure(db: *c.Sqlite3, code: int) -> Error = Error(code, message(db))
+
+// The message SQLite itself supplies for the most recent failure on this connection. Falling back to a
+// fixed string keeps the signature honest when even the message cannot be read.
+private message(db: *c.Sqlite3) -> string =
+    from_cstring(c.errmsg(db)).unwrap_or("the database reported an error it could not describe")
 
 // Open a database, creating the file when it is not already there.
+open(path: string) -> Result[&Db, Error] = open_with(path, Create)
+
+// Open an existing database for reading only, failing when there is no file to open.
+open_readonly(path: string) -> Result[&Db, Error] = open_with(path, Read)
+
+// Open a database as `access` says.
 //
-// The handle is written back through an out-parameter, so what is passed is `&db` -- a `**Sqlite3`.
+// The handle is written back through an out-parameter, so what is passed is `&db` -- a `**c.Sqlite3`.
 // A pointer to an opaque type is fine and a pointer to *that* is too: what `15 §9` withholds is the
 // layout of a `Sqlite3`, and neither of those needs one.
 //
-// SQLite hands back a usable connection even when opening fails, precisely so the message can be
-// read off it. So the failing path closes what it was given rather than leaking it, and the caller
-// gets a `string` instead of a handle it would have to know to release.
-open(path: string) -> Result[Db, string]
+// SQLite hands back a usable connection even when opening fails, precisely so the message can be read
+// off it. So the failing path closes what it was given rather than leaking it, and the caller gets an
+// `Error` instead of a handle it would have to know to release. The one case with no handle to ask is
+// an open that failed for want of memory, and `sqlite3_errmsg` answers "out of memory" to a null
+// connection rather than reading one, which is SQLite's own arrangement.
+open_with(path: string, access: Access) -> Result[&Db, Error]
     val name = cstring(path)
 
-    var db: *Sqlite3
+    var db: *c.Sqlite3
 
-    if c_open(name.ptr, &db, OPEN_RW, null) == OK then
+    val code = c.open(name.ptr, &db, access.code(), null)
+
+    if code == c.OK then
         Ok(Db(db))
     else
-        val why = message(db)
+        val why = failure(db, code)
 
-        c_close(db)
+        c.close(db)
         Err(why)
-end open
-
-// Open an existing database for reading only, failing when there is no file to open.
-open_readonly(path: string) -> Result[Db, string]
-    val name = cstring(path)
-
-    var db: *Sqlite3
-
-    if c_open(name.ptr, &db, OPEN_RO, null) == OK then
-        Ok(Db(db))
-    else
-        val why = message(db)
-
-        c_close(db)
-        Err(why)
-end open_readonly
+end open_with

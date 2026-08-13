@@ -2,7 +2,7 @@
  *
  * This file used to hold five more functions, each returning a `#define` --
  * `SQLITE_OK`, `SQLITE_ROW` and their siblings -- because a macro has no symbol
- * for an `extern` to name. They are gone: `sqlite.sysl` now asks the C compiler
+ * for an `extern` to name. They are gone: `c/c.sysl` now asks the C compiler
  * for those values directly, in a `c const` block, and gets constants rather
  * than calls. That is the better answer as well as the shorter one, since a
  * constant may stand in a `match` arm and be folded into a comparison.

@@ -10,17 +10,17 @@
 // arrived against `sysl.sum`, and compiles it as more modules.
 //
 //     dependencies {
-//       sqlite3 { git = "github.com/sysl-lang/sqlite3", version = "0.5.0" }
+//       sqlite3 { git = "github.com/sysl-lang/sqlite3", version = "0.6.0" }
 //     }
 //
 // The coordinate is identity rather than a URL, so it carries no `https://`, and the version is the
-// tag `v0.5.0` on this repository. Note that the coordinate names the *package*, `sqlite3`, while the
+// tag `v0.6.0` on this repository. Note that the coordinate names the *package*, `sqlite3`, while the
 // module a program imports is `sh.sysl.sqlite` -- `packages.md § 9` keeps those two deliberately
 // apart. `build-lib` and `--lib` still work, but they are no longer the only way in.
 
 package {
   name    = "sqlite3"
-  version = "0.5.0"
+  version = "0.6.0"
 }
 
 // SQLite is a hosted library: it opens files, and on this path it reaches the C runtime for them. A
@@ -34,7 +34,7 @@ package {
 //
 // **`headers` is the other kind of thing a package can need of its environment.** A capability is
 // answered by the target and there is nothing for anybody to go and do; a header is answered by a
-// path on a machine this package has never seen. `sqlite.sysl` says `@include("<sqlite3.h>")` and no
+// path on a machine this package has never seen. `c/c.sysl` says `@include("<sqlite3.h>")` and no
 // copy of that header is in this repository, so a build has to be told where one is.
 //
 // **It is declared even though macOS already has it**, and that is the whole reason this is worth a

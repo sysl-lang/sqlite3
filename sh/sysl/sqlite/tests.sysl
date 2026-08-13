@@ -1,22 +1,29 @@
 module sh.sysl.sqlite
 @tests
 
+import sysl.fs.{exists, remove_file}
+
 // The binding's own tests, run with `sysl test .` and against a real SQLite.
 //
-// Every one of them opens `:memory:`, which SQLite treats as a private database living for as long
-// as the connection -- so there is no file to clean up and no order dependence between tests.
+// Most of them open `:memory:`, which SQLite treats as a private database living for as long as the
+// connection -- so there is no file to clean up and no order dependence between tests. The one that
+// cannot use it is the one whose subject is what happens when there is no file, and it says so.
+//
+// **Nothing here closes a connection or finalizes a statement**, and that is the change these tests
+// pin as much as anything they assert: both are destructors now, so a test that forgot one would leak
+// rather than misbehave, and a test that called one would not compile.
 
-private fresh() -> Db
+private fresh() -> &Db
     open(":memory:") match
         Ok(db)   -> db
         Err(why) -> panic(f"could not open an in-memory database: ${why}%s")
 
 // The defect this cursor exists for: `prepare` compiles the first statement of a piece of text and
-// SQLite drops the rest with nothing said. That is not a failure and never was -- the tail pointer
-// is how a caller reaches what is left, and the binding used to pass null for it.
+// SQLite drops the rest with nothing said. That is not a failure and never was -- the tail pointer is
+// how a caller reaches what is left, and the binding used to pass null for it.
 @test("statements walks every statement in one piece of SQL")
 statements_walks_all_of_them()
-    var db = fresh()
+    val db = fresh()
     var walk = db.statements("CREATE TABLE a (x); INSERT INTO a VALUES (1); INSERT INTO a VALUES (2)")
     var seen = 0
 
@@ -25,31 +32,25 @@ statements_walks_all_of_them()
             None -> break
             Some(q) ->
                 q.step()
-                q.finalize()
                 seen += 1
 
     assert_eq(seen, 3, "three statements were compiled")
     assert(walk.error().is_none(), "and nothing was wrong with any of them")
-
-    db.close()
 end statements_walks_all_of_them
 
-// The half that says the walk is not merely counting: the second statement has to have *run*, which
-// is what the workaround it replaces could not get to.
+// The half that says the walk is not merely counting: the second statement has to have *run*, which is
+// what the workaround it replaces could not get to.
 @test("and running them all leaves what all of them did")
 exec_all_runs_all_of_them()
-    var db = fresh()
+    val db = fresh()
 
     assert_eq(db.exec_all("CREATE TABLE a (x); INSERT INTO a VALUES (1); INSERT INTO a VALUES (2)").unwrap(),
       3, "three statements ran")
 
-    var q = db.prepare("SELECT count(*) FROM a").unwrap()
+    val q = db.prepare("SELECT count(*) FROM a").unwrap()
 
     assert(q.step().unwrap(), "the count is a row")
     assert_eq(q.int_at(0), 2, "and both inserts landed")
-
-    q.finalize()
-    db.close()
 end exec_all_runs_all_of_them
 
 // `exec` is unchanged, and this is what pins that: the same text through the one-statement form runs
@@ -58,37 +59,32 @@ end exec_all_runs_all_of_them
 // sentence in a comment.
 @test("while exec still runs the first statement and no more")
 exec_is_still_one_statement()
-    var db = fresh()
+    val db = fresh()
 
     assert(db.exec("CREATE TABLE a (x); INSERT INTO a VALUES (1)").is_ok(), "the CREATE ran")
 
-    var q = db.prepare("SELECT count(*) FROM a").unwrap()
+    val q = db.prepare("SELECT count(*) FROM a").unwrap()
 
     assert(q.step().unwrap(), "the count is a row")
     assert_eq(q.int_at(0), 0, "and the INSERT after the semicolon did not")
-
-    q.finalize()
-    db.close()
 end exec_is_still_one_statement
 
 // Text that compiles to no statement at all is not the end of the walk. SQLite reports a run of
-// semicolons, trailing whitespace or a comment as success with a null handle, which is a piece of
-// text with nothing in it rather than an error -- so the cursor steps past it and asks again.
+// semicolons, trailing whitespace or a comment as success with a null handle, which is a piece of text
+// with nothing in it rather than an error -- so the cursor steps past it and asks again.
 @test("empty pieces between statements are stepped over rather than ending the walk")
 statements_skips_the_empty_pieces()
-    var db = fresh()
+    val db = fresh()
 
     assert_eq(db.exec_all("CREATE TABLE a (x);; ; INSERT INTO a VALUES (1); -- and a comment\n").unwrap(),
       2, "two real statements, and the empty pieces are not counted")
-
-    db.close()
 end statements_skips_the_empty_pieces
 
 // SQL that will not compile stops the walk and the message is asked for afterwards, because a cursor
 // out of text and one that hit bad SQL both answer `None` from `next`.
 @test("bad SQL stops the walk and is reported after it")
 statements_reports_why_it_stopped()
-    var db = fresh()
+    val db = fresh()
     var walk = db.statements("CREATE TABLE a (x); NOT SQL AT ALL")
     var seen = 0
 
@@ -97,40 +93,265 @@ statements_reports_why_it_stopped()
             None -> break
             Some(q) ->
                 q.step()
-                q.finalize()
                 seen += 1
 
     assert_eq(seen, 1, "the statement before the mistake compiled")
-    assert(walk.error().is_some(), "and the walk says why it stopped")
 
-    db.close()
+    walk.error() match
+        None      -> panic("the walk should say why it stopped")
+        Some(why) -> assert_eq(why.kind(), Failed, "SQL that will not compile is the unspecific code")
 end statements_reports_why_it_stopped
 
 // The count `exec_all` hands back with a failure is what actually ran, which is the honest number:
 // there is no transaction here, so the first statement has run and stays run.
 @test("exec_all stops at the first failure and says so")
 exec_all_stops_at_the_first_failure()
-    var db = fresh()
+    val db = fresh()
 
     assert(db.exec_all("CREATE TABLE a (x); NOT SQL AT ALL; INSERT INTO a VALUES (1)").is_err(),
       "the mistake is reported")
 
-    var q = db.prepare("SELECT count(*) FROM a").unwrap()
+    val q = db.prepare("SELECT count(*) FROM a").unwrap()
 
     assert(q.step().unwrap(), "the table was made before the mistake")
     assert_eq(q.int_at(0), 0, "and nothing after it ran")
-
-    q.finalize()
-    db.close()
 end exec_all_stops_at_the_first_failure
 
 // A single statement through the cursor is one statement, so nothing about the ordinary case moved.
 @test("one statement through the cursor is one statement")
 statements_over_one_statement()
-    var db = fresh()
+    val db = fresh()
 
     assert_eq(db.exec_all("CREATE TABLE a (x)").unwrap(), 1, "one ran")
     assert_eq(db.exec_all("").unwrap(), 0, "and empty text is a walk over nothing")
-
-    db.close()
 end statements_over_one_statement
+
+// ## The codes
+//
+// `Code.of` reads the header of the machine being built for, so nothing here can check it against that
+// header without asking the same question twice. What it can do is check it against the *numbers SQLite
+// publishes*, which are interface rather than implementation: the result codes have had these values
+// since version 3 and the documentation states them, so a build where `Code.of(5)` is not `Busy` has a
+// header disagreeing with SQLite's own documentation.
+@test("a code is the number SQLite documents for it")
+codes_are_the_documented_numbers()
+    assert_eq(Code.of(0), Success, "SQLITE_OK")
+    assert_eq(Code.of(1), Failed, "SQLITE_ERROR")
+    assert_eq(Code.of(5), Busy, "SQLITE_BUSY")
+    assert_eq(Code.of(8), ReadOnly, "SQLITE_READONLY")
+    assert_eq(Code.of(14), CantOpen, "SQLITE_CANTOPEN")
+    assert_eq(Code.of(19), Constraint, "SQLITE_CONSTRAINT")
+    assert_eq(Code.of(26), NotADb, "SQLITE_NOTADB")
+    assert_eq(Code.of(100), Row, "SQLITE_ROW")
+    assert_eq(Code.of(101), Done, "SQLITE_DONE")
+end codes_are_the_documented_numbers
+
+// A number SQLite has not given a primary code to is `Unknown` rather than a trap, which is what keeps
+// a program running against a newer library than this binding was written for.
+@test("a number the binding does not name is Unknown, and keeps its number")
+an_unnamed_code_is_unknown()
+    assert_eq(Code.of(1234), Unknown, "not a code this binding names")
+    assert_eq(Error(1234, "whatever it was").kind(), Unknown, "and an error carrying it says so")
+    assert_eq(Error(1234, "whatever it was").code, 1234, "while the number is still there to report")
+end an_unnamed_code_is_unknown
+
+// The reason `Code` exists at all: a caller can tell one failure from another without reading English.
+// A duplicate primary key is `Constraint` -- not something waiting will fix, and not the same as the
+// lock `Busy` reports.
+@test("a constraint violation is reported as a constraint")
+a_violation_is_a_constraint()
+    val db = fresh()
+
+    db.exec("CREATE TABLE a (x INTEGER PRIMARY KEY)").unwrap()
+    db.exec("INSERT INTO a VALUES (1)").unwrap()
+
+    db.exec("INSERT INTO a VALUES (1)") match
+        Ok(_)    -> panic("the second insert should have been refused")
+        Err(why) ->
+            assert_eq(why.kind(), Constraint, "the schema refused it")
+            assert_eq(why.code, 19, "which is SQLITE_CONSTRAINT")
+            assert(why.message.len > 0, "and SQLite's own sentence came with it")
+end a_violation_is_a_constraint
+
+// The two failures SQLite has no opinion about are marked as this binding's rather than dressed up as
+// the database's. Both are cases where SQLite reported success and handed over something unusable.
+@test("a failure that is not SQLite's says so")
+a_failure_of_our_own_is_marked()
+    val db = fresh()
+
+    db.prepare("-- nothing but a comment") match
+        Ok(_)    -> panic("there is no statement in a comment")
+        Err(why) ->
+            assert_eq(why.kind(), NotSqlite, "SQLite reported success and gave a null statement")
+            assert_eq(why.code, NOT_SQLITE, "which is the code reserved for this binding's own")
+end a_failure_of_our_own_is_marked
+
+// An error renders as SQLite's sentence and a code renders as the header's word for it, so a program
+// that logs either prints something a reader can act on.
+@test("an error prints its message and a code prints the header's name")
+errors_and_codes_render()
+    assert_eq(f"${Error(5, "database is locked")}%s", "database is locked", "the error is its message")
+    assert_eq(f"${Busy}%s", "SQLITE_BUSY", "and a code is the header's own word")
+end errors_and_codes_render
+
+// ## Ownership
+//
+// The hazard this conversion removes: a statement that outlives the scope its connection was opened in.
+// The `&Db` a `Query` holds is what makes it work, and there is nothing in the calling code that says
+// so -- which is the point.
+//
+// **Stepping the statement is not enough to see it**, and that is worth knowing before trusting this
+// pair. Take the reference away and `sqlite3_close` runs while the statement is live, which SQLite
+// *refuses*: the call answers `SQLITE_BUSY`, closes nothing, and leaks the connection -- so the
+// statement goes on working and a test that only stepped it would pass with the defect present. What
+// cannot survive a closed connection is compiling a *new* statement on it, so that is what both tests
+// here end with.
+@test("a statement keeps its connection alive after the scope that opened it has gone")
+a_query_outlives_the_scope_that_opened_the_database()
+    val q = lingering()
+
+    assert(q.step().unwrap(), "the statement still runs")
+    assert_eq(q.int_at(0), 42, "against a connection nothing here is holding")
+
+    val again = q.db.prepare("SELECT 43").unwrap()
+
+    assert(again.step().unwrap(), "and the connection is open rather than merely unfreed")
+    assert_eq(again.int_at(0), 43, "which a closed one could not have compiled")
+end a_query_outlives_the_scope_that_opened_the_database
+
+private lingering() -> &Query
+    val db = fresh()
+
+    db.prepare("SELECT 42").unwrap()
+
+// The cursor holds the connection for the same reason, so a walk handed out of the function that opened
+// the database is a walk over a database that is still open.
+@test("and so does a cursor")
+a_cursor_outlives_it_too()
+    var walk = lingering_walk()
+    var seen = 0
+
+    loop
+        walk.next() match
+            None -> break
+            Some(q) ->
+                assert(q.step().unwrap(), "the row is there")
+                seen += 1
+
+    assert_eq(seen, 2, "both statements compiled and ran")
+end a_cursor_outlives_it_too
+
+private lingering_walk() -> Statements
+    val db = fresh()
+
+    db.statements("SELECT 1; SELECT 2")
+
+// ## Binding parameters
+//
+// The statement comes back from a bind, so a call site chains rather than naming the statement once per
+// parameter.
+@test("bindings chain, and SQLite numbers them from 1")
+bindings_chain()
+    val db = fresh()
+
+    db.exec("CREATE TABLE a (n, s)").unwrap()
+
+    val ins = db.prepare("INSERT INTO a VALUES (?, ?)").unwrap()
+
+    ins.bind_int(1, 7).unwrap().bind_text(2, "seven").unwrap().step().unwrap()
+
+    val q = db.prepare("SELECT n, s FROM a").unwrap()
+
+    assert(q.step().unwrap(), "the row is there")
+    assert_eq(q.int_at(0), 7, "the integer arrived")
+    assert_eq(q.text_at(1).unwrap().unwrap(), "seven", "and so did the text")
+    assert_eq(q.columns(), 2, "two columns were selected")
+    assert_eq(q.name_at(0).unwrap(), "n", "and the first is named as the table declares it")
+end bindings_chain
+
+// An index outside the statement's parameters is `Range`, which is a mistake in the calling program and
+// worth being able to recognise as one.
+@test("a parameter index the statement does not have is Range")
+a_bad_index_is_range()
+    val db = fresh()
+    val q = db.prepare("SELECT ?").unwrap()
+
+    q.bind_int(2, 1) match
+        Ok(_)    -> panic("there is only one parameter")
+        Err(why) -> assert_eq(why.kind(), Range, "SQLITE_RANGE")
+end a_bad_index_is_range
+
+// SQL NULL and a value are different answers from `text_at`, and neither is an error.
+@test("a NULL text column is None rather than a failure")
+null_text_is_none()
+    val db = fresh()
+
+    db.exec_all("CREATE TABLE a (s); INSERT INTO a VALUES (NULL); INSERT INTO a VALUES ('here')").unwrap()
+
+    val q = db.prepare("SELECT s FROM a ORDER BY rowid").unwrap()
+
+    assert(q.step().unwrap(), "the first row")
+    assert(q.text_at(0).unwrap().is_none(), "which is SQL NULL")
+
+    assert(q.step().unwrap(), "the second row")
+    assert_eq(q.text_at(0).unwrap().unwrap(), "here", "which is a value")
+end null_text_is_none
+
+// Resetting keeps the compiled SQL and its bindings, which is what makes a prepared statement worth
+// preparing.
+@test("a statement runs again after a reset")
+reset_runs_it_again()
+    val db = fresh()
+
+    db.exec("CREATE TABLE a (x)").unwrap()
+
+    val ins = db.prepare("INSERT INTO a VALUES (?)").unwrap()
+
+    ins.bind_int(1, 1).unwrap().step().unwrap()
+    ins.reset().unwrap().bind_int(1, 2).unwrap().step().unwrap()
+
+    val q = db.prepare("SELECT count(*) FROM a").unwrap()
+
+    assert(q.step().unwrap(), "the count is a row")
+    assert_eq(q.int_at(0), 2, "the same statement ran twice")
+end reset_runs_it_again
+
+// ## Access
+//
+// **This is the test the binding could not have had**, because creating the file and opening it for
+// writing were one hard-coded number in C until the flags came from the header. `Write` is the
+// combination that was unreachable, and a missing file is the only way to see the difference.
+//
+// It is the one test here that touches the file system, so it removes the file first rather than
+// trusting the last run to have finished tidily.
+@test("Write opens a database that is there and refuses one that is not")
+access_tells_creating_from_opening()
+    val path = "/tmp/sysl-sqlite-access-probe.db"
+
+    if exists(path) then remove_file(path).unwrap()
+
+    open_with(path, Write) match
+        Ok(_)    -> panic("there is no file, and Write does not make one")
+        Err(why) -> assert_eq(why.kind(), CantOpen, "SQLITE_CANTOPEN")
+
+    assert(!exists(path), "and nothing was created by the attempt")
+
+    open_with(path, Create).unwrap().exec("CREATE TABLE a (x)").unwrap()
+
+    assert(exists(path), "Create made the file")
+
+    // The same call that failed a moment ago, against the same path.
+    assert(open_with(path, Write).unwrap().exec("INSERT INTO a VALUES (1)").is_ok(),
+      "and now writes to what is there")
+
+    // A read-only connection opens it and refuses to write to it.
+    val ro = open_readonly(path).unwrap()
+
+    assert(ro.exec("SELECT count(*) FROM a").is_ok(), "reading is what it is for")
+
+    ro.exec("INSERT INTO a VALUES (2)") match
+        Ok(_)    -> panic("a read-only connection should refuse a write")
+        Err(why) -> assert_eq(why.kind(), ReadOnly, "SQLITE_READONLY")
+
+    remove_file(path).unwrap()
+end access_tells_creating_from_opening
