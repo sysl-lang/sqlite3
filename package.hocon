@@ -10,17 +10,17 @@
 // arrived against `sysl.sum`, and compiles it as more modules.
 //
 //     dependencies {
-//       sqlite3 { git = "github.com/sysl-lang/sqlite3", version = "0.6.0" }
+//       sqlite3 { git = "github.com/sysl-lang/sqlite3", version = "0.6.1" }
 //     }
 //
 // The coordinate is identity rather than a URL, so it carries no `https://`, and the version is the
-// tag `v0.6.0` on this repository. Note that the coordinate names the *package*, `sqlite3`, while the
+// tag `v0.6.1` on this repository. Note that the coordinate names the *package*, `sqlite3`, while the
 // module a program imports is `sh.sysl.sqlite` -- `packages.md § 9` keeps those two deliberately
 // apart. `build-lib` and `--lib` still work, but they are no longer the only way in.
 
 package {
   name    = "sqlite3"
-  version = "0.6.0"
+  version = "0.6.1"
 }
 
 // SQLite is a hosted library: it opens files, and on this path it reaches the C runtime for them. A
@@ -53,7 +53,17 @@ package {
 // which is the same split `@link("sqlite3")` above draws against `--link-path`.
 requires {
   os = true
-  headers {
-    sqlite3 = "SQLite's own header, which this binding does not carry -- the macOS SDK has it, and a Linux box wants libsqlite3-dev"
+  // SQLite answers where it is itself: an `sqlite3.pc` sits beside the library, so the machine is
+  // asked rather than the reader. This replaces the `headers { sqlite3 = … }` this file carried until
+  // 0.6.1 and does not sit beside it -- the probe deliberately does not satisfy a header requirement,
+  // so declaring both would refuse every build that did not pass the flag the key exists to remove.
+  //
+  // Its cflags are usually empty, because the header is already on the default include path. The
+  // declaration is still worth making: it supplies the link line, and it turns a machine without
+  // SQLite into one refusal naming SQLite rather than a link that fails on an undefined symbol.
+  //
+  // `--include-path sqlite3=<dir>` still answers it and stops the probe.
+  pkg_config {
+    sqlite3 = "SQLite -- the macOS SDK carries it, a Debian box wants libsqlite3-dev, and pkg-config finds it either way"
   }
 }
