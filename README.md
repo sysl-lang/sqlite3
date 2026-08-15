@@ -42,7 +42,7 @@ tag `v0.6.0` here. Note that it names the **package**, `sqlite3`, while the modu
 Or build the package into an artifact once, then compile against it:
 
 ```
-sysl build-lib . -o /tmp/sqlite.syslib --include-path sqlite3=$(xcrun --show-sdk-path)/usr/include
+sysl build-lib . -o /tmp/sqlite.syslib
 sysl run yourprogram.sysl --lib /tmp/sqlite.syslib
 ```
 
@@ -50,32 +50,37 @@ sysl run yourprogram.sysl --lib /tmp/sqlite.syslib
 library's own header and travels inside the artifact, so a program that links is a program that did
 not have to know what this binds.
 
-## Say where SQLite's header is
+## SQLite has to be installed, and nothing has to be typed
 
 You will need SQLite's development files on the machine — `libsqlite3` and its header — since this is
 a binding and not a copy. `c/c.sysl` says `@include("<sqlite3.h>")` and no copy of that header is in
-this repository, so a build has to be told where one is:
+this repository.
+
+**Where they are is not your problem as of 0.6.1.** This package names SQLite in its `package.hocon`,
+and the compiler asks `pkg-config` where it lives, so a build is just:
 
 ```
-sysl build . --include-path sqlite3=$(xcrun --show-sdk-path)/usr/include   # macOS
-sysl build . --include-path sqlite3=/usr/include                           # Linux, after libsqlite3-dev
+sysl build .
 ```
 
-The name on the left of the `=` is this package's, declared in `package.hocon`, and it is how the
-compiler knows the requirement has been answered. A **bare** `--include-path` reaches clang but does
-not answer it, deliberately — the check asks what a build says it has rather than what it might
-happen to find, so that a declaration cannot be satisfied by accident on one machine and go
-unenforced on the next.
+Until 0.6.1 that line opened with `SQLITE_H=$(xcrun --show-sdk-path)/usr/include` on macOS and pointed
+at `/usr/include` on Linux, and every consuming project carried the flag.
 
-**On macOS that path is one clang already searches**, so the flag looks like ceremony there and is
-not. Without the declaration a Linux box that has no `libsqlite3-dev` finds out from the C compiler:
+The declaration is doing the same job it always did, and the refusal it buys is unchanged: a Linux box
+with no `libsqlite3-dev` is stopped by a sentence naming SQLite rather than by the C compiler saying
 
 ```
 fatal error: 'sqlite3.h' file not found
 ```
 
-which names a file and knows nothing about this package, the flag, or the thing to install. With it,
-the build stops first and says so.
+which names a file and knows nothing about this package or the thing to install.
+
+`--include-path sqlite3=<dir>` still answers it and takes precedence, for a machine with no
+pkg-config or a prefix you built yourself. A **bare** `--include-path` does not, deliberately — the
+check asks what a build says it has rather than what it might happen to find, so that a declaration
+cannot be satisfied by accident on one machine and go unenforced on the next.
+
+**Needs sysl 0.0.56**, which is where a package gained the ability to name its library.
 
 A program reaching this package through a **`.syslib`** needs none of this: an artifact carries the
 compiled shim, so `sysl run yourprogram.sysl --lib /tmp/sqlite.syslib` wants no header and no flag.
@@ -216,11 +221,11 @@ compiled *into* the library, and a library carries no entry point.
 
 ## The tests
 
-They run against a real SQLite, so they take the same flag a build does — which is the one thing about
-this package that differs from its siblings:
+They run against a real SQLite, so they need one installed — but they no longer take a flag for it,
+which used to be the one thing about this package that differed from its siblings:
 
 ```
-sysl test . --include-path sqlite3=$(xcrun --show-sdk-path)/usr/include
+sysl test .
 ```
 
 Nearly all of them open `:memory:`, which SQLite treats as a private database living for as long as the
