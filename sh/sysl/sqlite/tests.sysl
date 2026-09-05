@@ -2,6 +2,7 @@ module sh.sysl.sqlite
 @tests
 
 import sysl.fs.{exists, remove_file}
+import sysl.time.monotonic
 
 // The binding's own tests, run with `sysl test .` and against a real SQLite.
 //
@@ -355,3 +356,392 @@ access_tells_creating_from_opening()
 
     remove_file(path).unwrap()
 end access_tells_creating_from_opening
+
+// ## Values
+//
+// SQLite has five storage classes and this is where each of them is bound and read back. The subject
+// of most of what follows is the difference between what a *column* was declared as and what a *value*
+// turned out to be, because SQLite keeps them apart and a program mapping rows onto a language's own
+// values has to keep them apart too.
+
+// `Buf.view()` answers a `[]u8` and a fixture is a `[]const u8`; the two are different types and
+// deliberately so, and a parameter is where they meet.
+private same(got: []const u8, want: []const u8, what: string = "bytes differ") =
+    assert_eq(got, want, what)
+
+// Bytes chosen so that nothing about them survives being treated as text: a leading zero, an interior
+// zero, a trailing zero, and a byte that is not valid UTF-8 on its own.
+private embedded_zeros() -> []const u8 = [0, 1, 0, 255, 0]
+
+// One row holding one value of every storage class, which is the whole of what SQLite can store. A
+// program with a value model of its own has an arm for each of these and needs nothing else.
+@test("every storage class binds and reads back as what it was")
+every_storage_class_round_trips()
+    val db = fresh()
+
+    db.exec("CREATE TABLE v (i, l, r, t, b, n)").unwrap()
+
+    val ins = db.prepare("INSERT INTO v VALUES (?, ?, ?, ?, ?, ?)").unwrap()
+
+    ins.bind_int(1, 7).unwrap().bind_long(2, 4294967296i64).unwrap().bind_real(3, 0.5).unwrap()
+      .bind_text(4, "seven").unwrap().bind_blob(5, embedded_zeros()).unwrap().bind_null(6).unwrap()
+      .step().unwrap()
+
+    val q = db.prepare("SELECT i, l, r, t, b, n FROM v").unwrap()
+
+    assert(q.step().unwrap(), "the row is there")
+
+    assert_eq(q.type_at(0), Integer, "an int is stored as an integer")
+    assert_eq(q.int_at(0), 7, "and reads back")
+
+    assert_eq(q.type_at(1), Integer, "so is a long")
+    assert_eq(q.long_at(1), 4294967296i64, "at its full width")
+
+    assert_eq(q.type_at(2), Real, "a double is SQLITE_FLOAT")
+    assert_eq(q.real_at(2), 0.5, "and reads back exactly")
+
+    assert_eq(q.type_at(3), Text, "text is text")
+    assert_eq(q.text_at(3).unwrap().unwrap(), "seven", "and reads back")
+
+    assert_eq(q.type_at(4), Blob, "bytes are a blob")
+    same(q.blob_at(4).unwrap().view(), embedded_zeros(), "and every one of them came back")
+
+    assert_eq(q.type_at(5), Null, "and a bound NULL is SQL NULL")
+    assert(q.text_at(5).unwrap().is_none(), "which text_at reports as an absence")
+end every_storage_class_round_trips
+
+// The reason `long_at` and `bind_long` exist beside the `int` pair: SQLite stores an integer in up to
+// 64 bits and `sqlite3_column_int` keeps 32 of them. 2^32 is the smallest value where the difference is
+// visible, and the narrow reader answers zero rather than anything that looks wrong.
+@test("a 64-bit integer survives, where the 32-bit reader would truncate it")
+long_values_are_not_truncated()
+    val db = fresh()
+
+    db.exec("CREATE TABLE t (v)").unwrap()
+
+    val ins = db.prepare("INSERT INTO t VALUES (?)").unwrap()
+
+    ins.bind_long(1, 4294967296i64).unwrap().step().unwrap()
+
+    val q = db.prepare("SELECT v FROM t").unwrap()
+
+    assert(q.step().unwrap(), "the row is there")
+    assert_eq(q.long_at(0), 4294967296i64, "read whole")
+    assert_eq(q.int_at(0), 0, "while the 32-bit reader keeps only the low half, which is all zeros")
+end long_values_are_not_truncated
+
+// A blob carries its length, so a zero byte is a byte rather than the end. This is the difference a
+// program storing anything that is not text depends on, and a `bind_text` of the same bytes would have
+// stopped at the first one.
+@test("a blob round-trips through bytes that include zero")
+blobs_carry_zero_bytes()
+    val db = fresh()
+
+    db.exec("CREATE TABLE b (v)").unwrap()
+
+    val ins = db.prepare("INSERT INTO b VALUES (?)").unwrap()
+
+    ins.bind_blob(1, embedded_zeros()).unwrap().step().unwrap()
+
+    val q = db.prepare("SELECT v, length(v) FROM b").unwrap()
+
+    assert(q.step().unwrap(), "the row is there")
+    assert_eq(q.type_at(0), Blob, "stored as a blob")
+    same(q.blob_at(0).unwrap().view(), embedded_zeros(), "and every byte came back")
+    assert_eq(q.int_at(1), 5, "including the three zeros, which text would have ended at")
+end blobs_carry_zero_bytes
+
+// An empty value and no value are different, and SQLite's C API loses the difference at BOTH ends --
+// which is why this test is here and why it failed the first time it was run.
+//
+// Reading, `sqlite3_column_blob` answers a null pointer for a zero-length blob *and* for SQL NULL, so
+// a null check alone reports an empty value as no value; only the storage class tells them apart, and
+// `blob_at` asks for it first. Writing, a null pointer handed to `sqlite3_bind_blob` *is*
+// `sqlite3_bind_null` -- the length is ignored -- and sysl's `as_ptr` answers null for an empty slice,
+// so `bind_blob(i, [])` stored SQL NULL until the shim started substituting a byte SQLite will not
+// read.
+@test("a zero-length blob is a value, and SQL NULL is not")
+an_empty_blob_is_not_null()
+    val db = fresh()
+
+    db.exec("CREATE TABLE b (v)").unwrap()
+
+    val ins = db.prepare("INSERT INTO b VALUES (?)").unwrap()
+
+    ins.bind_blob(1, []).unwrap().step().unwrap()
+    ins.reset().unwrap().bind_null(1).unwrap().step().unwrap()
+
+    val q = db.prepare("SELECT v FROM b ORDER BY rowid").unwrap()
+
+    assert(q.step().unwrap(), "the empty blob")
+    assert_eq(q.type_at(0), Blob, "which is a blob")
+    assert(q.blob_at(0).is_some(), "and a value, though SQLite's pointer for it is null")
+    assert_eq(q.blob_at(0).unwrap().len(), 0, "with nothing in it")
+
+    assert(q.step().unwrap(), "and then SQL NULL")
+    assert_eq(q.type_at(0), Null, "which is not a blob")
+    assert(q.blob_at(0).is_none(), "and is the absence of a value")
+end an_empty_blob_is_not_null
+
+// **Every reader coerces and none of them refuses**, which is SQLite's rule and not this binding's. It
+// is written down as a test rather than as a sentence because it is the behaviour a caller is most
+// likely to mistake for a bug: nothing anywhere reports that the column held something else.
+@test("reading a column as the wrong type is SQLite's coercion rather than a failure")
+readers_coerce_and_never_object()
+    val db = fresh()
+
+    db.exec("CREATE TABLE t (v)").unwrap()
+    db.exec_all("INSERT INTO t VALUES ('3.5'); INSERT INTO t VALUES ('apple')").unwrap()
+    db.exec_all("INSERT INTO t VALUES (42); INSERT INTO t VALUES (NULL)").unwrap()
+
+    val q = db.prepare("SELECT v FROM t ORDER BY rowid").unwrap()
+
+    assert(q.step().unwrap(), "the text '3.5'")
+    assert_eq(q.type_at(0), Text, "stored as text")
+    assert_eq(q.int_at(0), 3, "which reads as a number by truncation")
+    assert_eq(q.real_at(0), 3.5, "or as a double, exactly")
+
+    assert(q.step().unwrap(), "the text 'apple'")
+    assert_eq(q.int_at(0), 0, "which is not a number at all, and is 0 rather than an error")
+    assert_eq(q.type_at(0), Text, "so 0 and a stored zero are told apart only here")
+
+    assert(q.step().unwrap(), "the integer 42")
+    assert_eq(q.type_at(0), Integer, "stored as an integer")
+    assert_eq(q.text_at(0).unwrap().unwrap(), "42", "and read back as its decimal spelling")
+
+    assert(q.step().unwrap(), "and SQL NULL")
+    assert_eq(q.type_at(0), Null, "which type_at names")
+    assert_eq(q.int_at(0), 0, "while the numeric readers answer 0, a value and not a signal")
+    assert_eq(q.real_at(0), 0.0, "both of them")
+    assert(q.text_at(0).unwrap().is_none(), "and only text_at reports the absence on its own")
+end readers_coerce_and_never_object
+
+// The declared type and the storage class are two different questions, and a row is where they
+// disagree: a column declared INTEGER holds the text that would not convert to one.
+@test("type_at is the value's question and decltype_at is the schema's")
+declared_types_are_not_storage_classes()
+    val db = fresh()
+
+    db.exec_all("CREATE TABLE t (n INTEGER, s VARCHAR(20)); INSERT INTO t VALUES ('not a number', 'five')").unwrap()
+
+    val q = db.prepare("SELECT n, s, count(*) FROM t").unwrap()
+
+    assert(q.step().unwrap(), "the row is there")
+
+    assert_eq(q.decltype_at(0).unwrap(), "INTEGER", "the schema's word for the first column")
+    assert_eq(q.type_at(0), Text, "over a value that is nothing of the kind")
+
+    assert_eq(q.decltype_at(1).unwrap(), "VARCHAR(20)", "the declaration verbatim, parentheses and all")
+
+    assert(q.decltype_at(2).is_none(), "while a count is an expression and has no declaration to read")
+    assert_eq(q.name_at(2).unwrap(), "count(*)", "though it still has a name")
+end declared_types_are_not_storage_classes
+
+// ## Binding, and the error path every bind shares
+
+// An index outside the statement's parameters is `Range` for all six of them, which is a mistake in the
+// calling program and worth recognising as one rather than discovering a NULL in the row afterwards.
+@test("every bind refuses an index the statement does not have")
+every_bind_reports_range()
+    val db = fresh()
+    val q = db.prepare("SELECT ?").unwrap()
+
+    assert_eq(q.bind_int(2, 1).unwrap_err().kind(), Range, "bind_int")
+    assert_eq(q.bind_long(2, 1i64).unwrap_err().kind(), Range, "bind_long")
+    assert_eq(q.bind_real(2, 1.0).unwrap_err().kind(), Range, "bind_real")
+    assert_eq(q.bind_text(2, "x").unwrap_err().kind(), Range, "bind_text")
+    assert_eq(q.bind_blob(2, embedded_zeros()).unwrap_err().kind(), Range, "bind_blob")
+    assert_eq(q.bind_null(2).unwrap_err().kind(), Range, "bind_null")
+
+    assert_eq(q.bind_null(0).unwrap_err().kind(), Range, "and 0, since SQLite numbers parameters from 1")
+end every_bind_reports_range
+
+// `parameters` is what a caller filling a statement from a list checks its length against, and
+// `clear_bindings` is the half of reuse that `reset` deliberately leaves undone.
+@test("parameters counts what the statement has, and clear_bindings is what reset does not do")
+parameter_count_and_clearing()
+    val db = fresh()
+
+    db.exec("CREATE TABLE t (a, b)").unwrap()
+
+    val ins = db.prepare("INSERT INTO t VALUES (?, ?)").unwrap()
+
+    assert_eq(ins.parameters(), 2, "two parameters, as the SQL wrote them")
+    assert_eq(db.prepare("SELECT 1").unwrap().parameters(), 0, "and none where there are none")
+
+    ins.bind_int(1, 1).unwrap().bind_int(2, 2).unwrap().step().unwrap()
+    ins.reset().unwrap().step().unwrap()
+    ins.reset().unwrap().clear_bindings().unwrap().step().unwrap()
+
+    val q = db.prepare("SELECT a, b FROM t ORDER BY rowid").unwrap()
+
+    assert(q.step().unwrap(), "the first row")
+    assert_eq(q.int_at(0), 1, "as it was bound")
+
+    assert(q.step().unwrap(), "the second")
+    assert_eq(q.int_at(0), 1, "which a reset alone carried across")
+
+    assert(q.step().unwrap(), "and the third")
+    assert_eq(q.type_at(0), Null, "where clear_bindings left NULL")
+    assert_eq(q.type_at(1), Null, "in every parameter rather than the one")
+end parameter_count_and_clearing
+
+// ## What the connection has to say afterwards
+
+@test("last_insert_rowid names the row just inserted, and changes counts what a statement touched")
+the_connection_reports_what_it_did()
+    val db = fresh()
+
+    db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, v)").unwrap()
+
+    assert_eq(db.last_insert_rowid(), 0i64, "nothing has been inserted on this connection yet")
+
+    db.exec("INSERT INTO t (v) VALUES ('a')").unwrap()
+
+    assert_eq(db.last_insert_rowid(), 1i64, "the key SQLite chose, which the caller did not")
+    assert_eq(db.changes(), 1, "one row went in")
+
+    db.exec("INSERT INTO t (v) VALUES ('b')").unwrap()
+
+    assert_eq(db.last_insert_rowid(), 2i64, "and the next one")
+
+    db.exec("UPDATE t SET v = 'c'").unwrap()
+
+    assert_eq(db.changes(), 2, "an UPDATE with no WHERE touched both rows")
+
+    db.exec("DELETE FROM t WHERE v = 'nothing matches this'").unwrap()
+
+    assert_eq(db.changes(), 0, "and a statement that matched nothing is 0 rather than an error")
+    assert_eq(db.last_insert_rowid(), 2i64, "while the last key stands, a DELETE not having made one")
+end the_connection_reports_what_it_did
+
+// ## Transactions
+
+@test("a transaction either all happens or none of it does")
+transactions_commit_and_roll_back()
+    val db = fresh()
+
+    db.exec("CREATE TABLE t (x)").unwrap()
+
+    assert(!db.in_transaction(), "nothing is open to begin with")
+
+    db.begin().unwrap()
+
+    assert(db.in_transaction(), "and now something is")
+
+    db.exec("INSERT INTO t VALUES (1)").unwrap()
+    db.rollback().unwrap()
+
+    assert(!db.in_transaction(), "the rollback closed it")
+    assert_eq(rows_in(db), 0, "and undid the insert")
+
+    db.begin().unwrap()
+    db.exec("INSERT INTO t VALUES (2)").unwrap()
+    db.commit().unwrap()
+
+    assert(!db.in_transaction(), "the commit closed it too")
+    assert_eq(rows_in(db), 1, "and what was committed stayed")
+end transactions_commit_and_roll_back
+
+private rows_in(db: &Db) -> int
+    val q = db.prepare("SELECT count(*) FROM t").unwrap()
+
+    q.step().unwrap()
+    q.int_at(0)
+
+// The error path of the pair: SQLite has no nested transactions, so a second `begin` is refused rather
+// than counted. `in_transaction` is how a caller that might be inside one already asks first.
+@test("a transaction inside a transaction is refused")
+transactions_do_not_nest()
+    val db = fresh()
+
+    db.begin().unwrap()
+
+    db.begin() match
+        Ok(_)    -> panic("SQLite has no nested transactions")
+        Err(why) ->
+            assert_eq(why.kind(), Failed, "the unspecific code, with the interesting part in the message")
+            assert(why.message.len > 0, "which SQLite supplied")
+
+    assert(db.in_transaction(), "and the one that was open is still open")
+
+    db.rollback().unwrap()
+
+    db.rollback() match
+        Ok(_)    -> panic("there is nothing left to roll back")
+        Err(why) -> assert_eq(why.kind(), Failed, "so a second rollback is refused as well")
+end transactions_do_not_nest
+
+// `busy_timeout` is the answer to `Busy` for a program that has no better one. Two connections to one
+// file is the only way to see it, so this is the second test here that touches the file system.
+//
+// **The wait is what is asserted, not the answer**, because the answer is `Busy` either way: the other
+// connection never lets go. What changes is that the second attempt does not come back at once.
+@test("busy_timeout is how long a locked database is waited for")
+busy_timeout_waits_before_giving_up()
+    val path = "/tmp/sysl-sqlite-busy-probe.db"
+
+    if exists(path) then remove_file(path).unwrap()
+
+    val holder = open(path).unwrap()
+
+    holder.exec("CREATE TABLE t (x)").unwrap()
+
+    val waiter = open(path).unwrap()
+
+    holder.exec("BEGIN IMMEDIATE").unwrap()
+
+    waiter.exec("BEGIN IMMEDIATE") match
+        Ok(_)    -> panic("the other connection is holding the write lock")
+        Err(why) -> assert_eq(why.kind(), Busy, "and with no timeout the refusal is immediate")
+
+    waiter.busy_timeout(300).unwrap()
+
+    val started = monotonic().us
+
+    waiter.exec("BEGIN IMMEDIATE") match
+        Ok(_)    -> panic("the lock is still held")
+        Err(why) -> assert_eq(why.kind(), Busy, "so the answer is the same one")
+
+    assert(monotonic().us - started >= 250000i64, "but it waited for it rather than answering at once")
+
+    holder.exec("ROLLBACK").unwrap()
+
+    assert(waiter.exec("BEGIN IMMEDIATE").is_ok(), "and once the lock is let go the write proceeds")
+
+    waiter.exec("ROLLBACK").unwrap()
+    remove_file(path).unwrap()
+end busy_timeout_waits_before_giving_up
+
+// ## What this SQLite was built with
+//
+// SQLite is the machine's library rather than one this package carries, so what it can do is a property
+// of the machine. FTS5 is the case worth checking, since a program that means to use it otherwise finds
+// out at the `CREATE VIRTUAL TABLE`, which fails with the unspecific code and "no such module: fts5".
+@test("this SQLite has FTS5, and either spelling of an option name asks the same question")
+fts5_is_compiled_in()
+    assert(compiled_with("ENABLE_FTS5"), "SQLITE_ENABLE_FTS5 was set when this library was built")
+    assert(compiled_with("SQLITE_ENABLE_FTS5"), "and the SQLITE_ prefix is optional rather than wrong")
+    assert(!compiled_with("ENABLE_NOTHING_OF_THE_SORT"), "while an option nobody has is simply false")
+end fts5_is_compiled_in
+
+// The claim the check above makes, made again by using it: a full-text table, a match, and the score
+// read as the double it is. `bm25()` and the hidden `rank` column are the same number, and both are
+// negative because FTS5 orders a better match first by making it smaller.
+@test("a full-text search runs and its bm25 rank reads as a double")
+fts5_ranks_are_doubles()
+    val db = fresh()
+
+    db.exec("CREATE VIRTUAL TABLE docs USING fts5(body)").unwrap()
+    db.exec_all("INSERT INTO docs VALUES ('the quick brown fox'); INSERT INTO docs VALUES ('a turtle')").unwrap()
+
+    val q = db.prepare("SELECT body, bm25(docs), rank FROM docs WHERE docs MATCH 'fox' ORDER BY rank").unwrap()
+
+    assert(q.step().unwrap(), "the matching document")
+    assert_eq(q.text_at(0).unwrap().unwrap(), "the quick brown fox", "which is the one with the word in it")
+    assert_eq(q.type_at(1), Real, "bm25 answers a double")
+    assert(q.real_at(1) < 0.0, "and a better match is a more negative number, which is FTS5's convention")
+    assert_eq(q.real_at(2), q.real_at(1), "while rank is that same score under another name")
+
+    assert(!q.step().unwrap(), "and nothing else matched")
+end fts5_ranks_are_doubles

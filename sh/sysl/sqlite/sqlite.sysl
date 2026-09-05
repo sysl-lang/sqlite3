@@ -1,6 +1,8 @@
 module sh.sysl.sqlite
 
 import sh.sysl.sqlite.c
+import sysl.buf.{Buf, buf}
+import sysl.slices.as_ptr
 import sysl.text.{cstring, from_cstring, CString}
 
 // SQLite, bound in two layers: `sh.sysl.sqlite.c` beside this file is the boundary as C declares it,
@@ -27,6 +29,16 @@ import sysl.text.{cstring, from_cstring, CString}
 // the second one for languages whose destructors run in an order nobody controls; sysl's run in the
 // order the references go, so the stricter call is the correct one and its refusal is unreachable.
 //
+// **SQLite has five storage classes and there is a `bind_` and an `_at` for each**, which is what a
+// program with a value model of its own needs and the whole of it: an integer at two widths, a double,
+// text, bytes and NULL. `Query.type_at` says which one a value in the current row actually is --
+// SQLite is dynamically typed, so that is a question about the *value* and not about the column, and
+// `ColumnType` is where the difference is set out.
+//
+// **Every reader coerces rather than refusing**, which is SQLite's rule and the thing most likely to
+// be mistaken for a defect here: `int_at` on the text `"apple"` is 0, and nothing anywhere reports
+// that the column held something else. `type_at` is the only way to tell that 0 from a stored zero.
+//
 // ==What a program looks like==
 //
 //     val db = open("notes.db")?
@@ -37,6 +49,8 @@ import sysl.text.{cstring, from_cstring, CString}
 //
 //     add.bind_text(1, "the first one")?
 //     add.step()?
+//
+//     val id = db.last_insert_rowid()
 //
 // The library it links is named once, in `c/c.sysl`, and the header it measures SQLite's codes from is
 // named there too. A program depending on this package says nothing about either.
@@ -257,6 +271,58 @@ enum Access
         Read   -> c.OPEN_READONLY
 end Access
 
+// What a value in the current row actually is, which is what `Query.type_at` answers.
+//
+// **SQLite is dynamically typed and this is the type**, not the column's declaration. A column
+// declared `INTEGER` holds whatever was stored in it, so `SELECT x FROM t` may hand back an integer on
+// one row and text on the next -- which is why a program mapping SQLite onto a language with values of
+// its own asks this per row rather than reading the schema once.
+//
+// **Every reader coerces rather than refusing**, and that is SQLite's rule rather than this binding's.
+// `int_at` on a text column answers what SQLite makes of those bytes as a number -- `0` where they are
+// not a number at all -- and `text_at` on an integer answers its decimal spelling. Nothing reports a
+// mismatch, because nothing considers it one. `type_at` is therefore the *only* way to tell a stored 0
+// from a stored `"apple"`, and a reader that cares asks it first.
+//
+// The variant for `SQLITE_FLOAT` is `Real`, since `real` is what sysl calls the type it comes back as
+// and `Float` would be a name for something the language does not have. `name` answers the header's
+// own word for all five.
+enum ColumnType
+    // A signed integer, of up to 64 bits -- so `long_at` is the reader that cannot lose any of it.
+    Integer
+    // `SQLITE_FLOAT`: an IEEE double, read with `real_at`.
+    Real
+    // UTF-8 text, read with `text_at`.
+    Text
+    // A counted run of bytes, read with `blob_at`. It may hold zeros, and it may be empty.
+    Blob
+    // SQL NULL. `text_at` and `blob_at` answer `None` for it; the numeric readers answer 0, which is a
+    // real answer and not a signal.
+    Null
+
+    // Which type a number is. Like `Code.of` this travels one way only. SQLite answers one of five
+    // numbers and nothing else, so the last arm takes the number rather than testing it -- and a
+    // library that somehow answered a sixth would be reported as the absence of a value, which is the
+    // safe reading of a value this binding cannot name.
+    of(code: int) -> ColumnType = code match
+        c.INTEGER -> Integer
+        c.FLOAT   -> Real
+        c.TEXT    -> Text
+        c.BLOB    -> Blob
+        _         -> Null
+
+    // The header's own word for this type, for a program that logs one.
+    name(self) -> string = self match
+        Integer -> "SQLITE_INTEGER"
+        Real    -> "SQLITE_FLOAT"
+        Text    -> "SQLITE_TEXT"
+        Blob    -> "SQLITE_BLOB"
+        Null    -> "SQLITE_NULL"
+end ColumnType
+
+impl Display for ColumnType
+    display(self, out: *Writer, fmt: FormatSpec) = display_str(self.name(), out, fmt)
+
 // A prepared statement.
 //
 // The handle is SQLite's storage and the destructor below releases it, so nothing has to be finalized
@@ -289,7 +355,27 @@ struct Query
 
     // The columns of the current row, by position. These are only meaningful after `step` answered
     // `true`, which is SQLite's rule rather than this binding's.
+    //
+    // **Every one of them coerces rather than failing.** SQLite converts whatever it is holding into
+    // what was asked for -- `int_at` on the text `"3.9"` is 3, on `"apple"` is 0, and on SQL NULL is 0
+    // -- and there is no error path here because SQLite raises nothing and would answer the same way
+    // again. `type_at` is how a caller finds out what is really there; see `ColumnType`.
     int_at(&self, col: int) -> int = c.column_int(self.handle, col)
+
+    // The same column as a 64-bit integer. **This is the one that cannot lose anything**: SQLite
+    // stores integers in up to 64 bits, and `int_at` is `sqlite3_column_int`, which truncates. A
+    // rowid, a millisecond timestamp and anything counted by a database rather than by a loop belong
+    // here.
+    long_at(&self, col: int) -> long = c.column_int64(self.handle, col)
+
+    // The column as an IEEE double. This is what an FTS5 `bm25()` or `rank` is read with, and what a
+    // `REAL` column answers without conversion.
+    real_at(&self, col: int) -> real = c.column_double(self.handle, col)
+
+    // What this column of this row is actually holding, which is a property of the value rather than
+    // of the schema. **It is the only way to tell a stored 0 from a stored `"apple"`**, since both
+    // read as 0 through `int_at`, and the only way to tell SQL NULL from a zero-length blob.
+    type_at(&self, col: int) -> ColumnType = ColumnType.of(c.column_type(self.handle, col))
 
     // A text column. Two things can be wrong with one and they are different, so the type says both:
     // `Ok(None)` is SQL NULL, and `Err` is a value whose bytes are not UTF-8 -- the second carrying
@@ -313,6 +399,35 @@ struct Query
                 Err(_) -> Err(Error(NOT_SQLITE, "a text column held bytes that are not valid UTF-8"))
     end text_at
 
+    // A blob column, copied out. `None` is SQL NULL; `Some` of an empty `Buf` is a blob that is
+    // genuinely empty, and the two are different values.
+    //
+    // **Telling them apart is why this asks `column_type` first, and it is not a stylistic choice.**
+    // `sqlite3_column_blob` returns a null pointer for a zero-length blob *and* for SQL NULL, so a
+    // null check alone would report `x'' ` as the absence of a value. Nothing in the pointer or the
+    // length distinguishes them; only the storage class does.
+    //
+    // The bytes are copied rather than borrowed, because SQLite's own copy is valid only until the
+    // next `step` -- and unlike text, a blob has no terminator, so `column_bytes` is what says how
+    // many there are. **It is asked after `column_blob` and not before**, which is SQLite's rule:
+    // either call may convert the value in place, and the length is the length of whatever the last
+    // one produced.
+    //
+    // Nothing here can fail, so this is an `Option` rather than a `Result`: a blob is bytes, and there
+    // is no encoding for them to be wrong in.
+    blob_at(&self, col: int) -> Option[Buf[u8]]
+        if c.column_type(self.handle, col) == c.NULL_TYPE then return None
+
+        val p = c.column_blob(self.handle, col)
+        val n = c.column_bytes(self.handle, col)
+
+        var out: Buf[u8] = buf()
+
+        if n > 0 then out.extend(p[0..<usize(n)])
+
+        Some(out)
+    end blob_at
+
     // The column's name as the statement declares it, for callers reading a row whose SQL they did not
     // write. Absent when SQLite cannot supply one -- and, unlike a value, a name that will not decode
     // is not worth distinguishing: it came from SQL the caller compiled, so bytes that are not UTF-8
@@ -328,43 +443,102 @@ struct Query
                 Err(_) -> None
     end name_at
 
+    // The type the schema declared for this column, as the `CREATE TABLE` wrote it -- `"INTEGER"`,
+    // `"VARCHAR(20)"`, whatever the text was. Absent for a column that is an expression rather than a
+    // table's, since `SELECT count(*)` has no declaration to read.
+    //
+    // **A declared type is an affinity and not a promise**, so this says what the schema intended and
+    // `type_at` says what arrived. A program building a value out of a row wants the second one; a
+    // program showing somebody a table's shape wants this.
+    decltype_at(&self, col: int) -> Option[string]
+        val p = c.column_decltype(self.handle, col)
+
+        if p == null then
+            None
+        else
+            from_cstring(p) match
+                Ok(s)  -> Some(s)
+                Err(_) -> None
+    end decltype_at
+
     columns(&self) -> int = c.column_count(self.handle)
+
+    // How many parameters this statement has, which is the largest index `bind_*` will accept.
+    //
+    // A caller filling a statement from a list it was handed checks its length against this once,
+    // rather than discovering the mismatch one `Range` at a time.
+    parameters(&self) -> int = c.bind_parameter_count(self.handle)
+
+    // What every call below answers: the statement back on success, so that bindings chain, and the
+    // connection's own message on failure.
+    private chained(&self, code: int) -> Result[&Query, Error] =
+        if code == c.OK then Ok(self) else Err(failure(self.db.handle, code))
 
     // Parameters are bound by index, and SQLite numbers them from 1 rather than 0. The binding keeps
     // SQLite's numbering instead of correcting it, so that a `?` counted in the SQL and an index
     // written here agree without a rule to remember.
     //
-    // The statement itself comes back, so bindings chain: `q.bind_int(1, 7)?.step()`.
-    bind_int(&self, index: int, value: int) -> Result[&Query, Error]
-        val code = c.bind_int(self.handle, index, value)
+    // An index the statement does not have is `Range` rather than anything silent, which is what makes
+    // an off-by-one findable. The statement itself comes back, so bindings chain:
+    // `q.bind_int(1, 7)?.step()`.
+    //
+    // **There is one of these per storage class, and together they are the whole of what SQLite can
+    // hold** -- an integer at two widths, a double, text, bytes and NULL. A program mapping a
+    // language's own values onto a statement has an arm for each and needs nothing else.
+    bind_int(&self, index: int, value: int) -> Result[&Query, Error] =
+        self.chained(c.bind_int(self.handle, index, value))
 
-        if code == c.OK then
-            Ok(self)
-        else
-            Err(failure(self.db.handle, code))
-    end bind_int
+    // A 64-bit integer, which is the width SQLite stores one at. `bind_int` is the narrower call and
+    // is kept because most parameters are ordinary numbers; anything counted by a database -- a rowid,
+    // a millisecond timestamp -- belongs here.
+    bind_long(&self, index: int, value: long) -> Result[&Query, Error] =
+        self.chained(c.bind_int64(self.handle, index, value))
+
+    // An IEEE double. SQLite has one floating type and this is it.
+    bind_real(&self, index: int, value: real) -> Result[&Query, Error] =
+        self.chained(c.bind_double(self.handle, index, value))
+
+    // SQL NULL, which is a value to bind rather than a parameter to leave alone.
+    //
+    // **An unbound parameter is already NULL**, so this looks redundant and is not: a statement being
+    // reused carries its previous bindings across a `reset`, and binding NULL is how one of them is
+    // cleared. `clear_bindings` is the same thing for all of them at once.
+    bind_null(&self, index: int) -> Result[&Query, Error] =
+        self.chained(c.bind_null(self.handle, index))
 
     bind_text(&self, index: int, value: string) -> Result[&Query, Error]
         val text = cstring(value)
-        val code = c.bind_text(self.handle, index, text.ptr)
 
-        if code == c.OK then
-            Ok(self)
-        else
-            Err(failure(self.db.handle, code))
+        self.chained(c.bind_text(self.handle, index, text.ptr))
     end bind_text
+
+    // A counted run of bytes, stored as a blob.
+    //
+    // **A blob is not text and the difference is the zero byte.** Text ends at one; a blob carries its
+    // length, so bytes that happen to include zeros make it through unchanged -- which is the whole
+    // reason a program with a value model of its own reaches for this rather than encoding to a
+    // string.
+    //
+    // **An empty slice binds a zero-length blob, which is a value and is not SQL NULL** -- and that
+    // costs the shim a line, because C's spelling of the two is the same. A null pointer handed to
+    // `sqlite3_bind_blob` means `sqlite3_bind_null`, the length being ignored, and `as_ptr` answers
+    // null for an empty slice; so the shim substitutes the address of a byte SQLite will not read.
+    //
+    // SQLite takes its own copy before this returns, so nothing here has to outlive the call.
+    bind_blob(&self, index: int, value: []const u8) -> Result[&Query, Error] =
+        self.chained(c.bind_blob(self.handle, index, as_ptr(value), int(value.len)))
 
     // Return the statement to its unstepped state, keeping the compiled SQL and its bindings. This is
     // what makes a prepared statement worth preparing: the same `Query` runs again without SQLite
     // parsing the text a second time.
-    reset(&self) -> Result[&Query, Error]
-        val code = c.reset(self.handle)
+    reset(&self) -> Result[&Query, Error] = self.chained(c.reset(self.handle))
 
-        if code == c.OK then
-            Ok(self)
-        else
-            Err(failure(self.db.handle, code))
-    end reset
+    // Set every parameter back to NULL, which `reset` deliberately does not.
+    //
+    // The pair is what a statement reused with a *different* set of values wants: `reset` alone leaves
+    // the last row's bindings in place, so a parameter the new row has nothing to say about would
+    // silently carry the old value forward.
+    clear_bindings(&self) -> Result[&Query, Error] = self.chained(c.clear_bindings(self.handle))
 end Query
 
 // The statement goes when the last reference to it does, and the connection it holds only afterwards.
@@ -516,6 +690,65 @@ struct Db
             Some(why) -> Err(why)
             None      -> Ok(ran)
     end exec_all
+
+    // ## What the connection has to say afterwards
+
+    // The key SQLite gave the row most recently inserted on this connection.
+    //
+    // **It is 64 bits and it is the connection's, not the statement's**, so it is read straight after
+    // the insert that made it and before anything else on this connection inserts. A table declared
+    // with an `INTEGER PRIMARY KEY` column stores the rowid *in* that column, so this is how a program
+    // learns the identity of a row it did not choose one for.
+    //
+    // Zero before anything has been inserted, which SQLite documents and this does not dress up as an
+    // absence: a caller that has just inserted knows it has.
+    last_insert_rowid(&self) -> long = c.last_insert_rowid(self.handle)
+
+    // How many rows the most recent `INSERT`, `UPDATE` or `DELETE` on this connection changed.
+    //
+    // **A `DELETE` that matched nothing answers 0, and that is not an error** -- which is exactly what
+    // it is for: a statement that ran successfully and did nothing is invisible without it.
+    // Rows changed by a trigger or by `ON DELETE CASCADE` are not counted here, which is SQLite's rule.
+    changes(&self) -> int = c.changes(self.handle)
+
+    // How long to keep retrying a locked database before answering `Busy`, in milliseconds. Zero, the
+    // default, means answer immediately.
+    //
+    // This is the answer to `Busy` for a program that has no better one: another connection is part
+    // way through a write and will be finished shortly, and waiting is what a person at the other end
+    // of the program would have wanted.
+    busy_timeout(&self, ms: int) -> Result[unit, Error] = checked(self.handle, c.busy_timeout(self.handle, ms))
+
+    // ## Transactions
+
+    // Begin a transaction, so that what follows either all happens or none of it does.
+    //
+    // **This is what `exec_all` says to reach for**, since a piece of SQL that fails part way through
+    // leaves what already ran run. It is a deferred transaction -- SQLite takes no lock until the
+    // first read or write -- which is the default and the one to want.
+    //
+    // Nested calls are refused by SQLite with `Failed` and the message "cannot start a transaction
+    // within a transaction". Ask `in_transaction` where that is a possibility rather than treating the
+    // refusal as a surprise.
+    begin(&self) -> Result[unit, Error] = self.exec("BEGIN").map((_) -> ())
+
+    // Make everything since `begin` permanent.
+    commit(&self) -> Result[unit, Error] = self.exec("COMMIT").map((_) -> ())
+
+    // Undo everything since `begin`.
+    //
+    // **The rollback is the path worth writing**, and it is the one a program forgets: a failure
+    // between `begin` and `commit` that simply returns leaves the transaction open, holding whatever
+    // locks it had taken, until the connection is closed.
+    rollback(&self) -> Result[unit, Error] = self.exec("ROLLBACK").map((_) -> ())
+
+    // Whether a transaction is open on this connection.
+    //
+    // SQLite answers this the other way round -- `sqlite3_get_autocommit` is non-zero when there is
+    // *no* transaction -- and the inversion is done here so that a caller reads the name and not the
+    // negation. It is also the honest way to ask after a failed statement, since some errors roll a
+    // transaction back on their own.
+    in_transaction(&self) -> bool = c.get_autocommit(self.handle) == 0
 end Db
 
 // The connection closes when the last reference to it goes -- which, by the field a `Query` carries,
@@ -531,6 +764,10 @@ impl Drop for Db
 
 // The error SQLite is carrying on this connection, as a code and the sentence that goes with it.
 private failure(db: *c.Sqlite3, code: int) -> Error = Error(code, message(db))
+
+// A result code from a call on the connection that answers nothing else, turned into a `Result`.
+private checked(db: *c.Sqlite3, code: int) -> Result[unit, Error] =
+    if code == c.OK then Ok(()) else Err(failure(db, code))
 
 // The message SQLite itself supplies for the most recent failure on this connection. Falling back to a
 // fixed string keeps the signature honest when even the message cannot be read.
@@ -569,3 +806,20 @@ open_with(path: string, access: Access) -> Result[&Db, Error]
         c.close(db)
         Err(why)
 end open_with
+
+// Whether the SQLite this program links was built with a named compile-time option.
+//
+// **The `SQLITE_` prefix is optional**: `compiled_with("ENABLE_FTS5")` and
+// `compiled_with("SQLITE_ENABLE_FTS5")` answer the same thing, which is worth stating because a
+// binding that got it wrong would be indistinguishable from a library that lacks the option -- an
+// option nobody has ever heard of is a `false` and not a complaint.
+//
+// It is a question worth asking because SQLite is a library the machine supplies rather than one this
+// package carries, so what it can do is a property of that machine. `ENABLE_FTS5` is the usual case: a
+// program that means to run `CREATE VIRTUAL TABLE ... USING fts5` can find out here rather than at the
+// statement, which fails with the unspecific `Failed` and the message "no such module: fts5".
+compiled_with(option: string) -> bool
+    val name = cstring(option)
+
+    c.compileoption_used(name.ptr) != 0
+end compiled_with

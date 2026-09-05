@@ -1,4 +1,4 @@
-/* The one thing a SQLite binding still cannot say in sysl.
+/* The one thing a SQLite binding still cannot say in sysl, said twice.
  *
  * This file used to hold five more functions, each returning a `#define` --
  * `SQLITE_OK`, `SQLITE_ROW` and their siblings -- because a macro has no symbol
@@ -9,9 +9,13 @@
  *
  * What is left is not a value at all. `SQLITE_TRANSIENT` is the cast
  * `((sqlite3_destructor_type)-1)` -- a function pointer whose value no signature
- * describes, and which nothing outside C can construct. `sqlite3_bind_text`
- * cannot be called correctly without it, so the call is made here and the sysl
- * side never sees it.
+ * describes, and which nothing outside C can construct. `sqlite3_bind_text` and
+ * `sqlite3_bind_blob` cannot be called correctly without it, so the call is made
+ * here and the sysl side never sees it.
+ *
+ * The two are the whole of the boundary that hands SQLite bytes it has to keep;
+ * every other `bind_` takes a number, which is copied by the ordinary rules of a
+ * C call and needs nothing.
  *
  * Nothing in this file is sysl-specific. It is the ordinary shim any language
  * writes when it binds a C library, and `build-lib` compiles it because it is
@@ -28,4 +32,28 @@
  */
 int sysl_sqlite_bind_text(sqlite3_stmt *stmt, int index, const char *value) {
     return sqlite3_bind_text(stmt, index, value, -1, SQLITE_TRANSIENT);
+}
+
+/* Bind a counted run of bytes, telling SQLite to take its own copy.
+ *
+ * A blob carries its length rather than ending at a zero byte, which is the
+ * whole difference from the call above: a `-1` here would mean nothing, and a
+ * blob holding an embedded NUL is the ordinary case rather than a corner one.
+ *
+ * The substitution below is the reason this cannot simply forward. A null
+ * pointer is `sqlite3_bind_blob`'s way of spelling `sqlite3_bind_null` -- the
+ * length is ignored outright and the parameter becomes SQL NULL -- and sysl's
+ * `as_ptr` answers null for an empty slice, which is exactly the caller who
+ * meant a zero-length blob. Handing SQLite the address of a byte it will not
+ * read is what keeps an empty value from turning into no value at all.
+ */
+int sysl_sqlite_bind_blob(sqlite3_stmt *stmt, int index, const void *value, int n) {
+    static const char empty = 0;
+
+    if (n <= 0) {
+        value = &empty;
+        n = 0;
+    }
+
+    return sqlite3_bind_blob(stmt, index, value, n, SQLITE_TRANSIENT);
 }

@@ -83,6 +83,23 @@ c const
     ROW: int        = "SQLITE_ROW"
     DONE: int       = "SQLITE_DONE"
 
+// What `sqlite3_column_type` answers: the storage class of the value this column of this row is
+// actually holding.
+//
+// **A storage class belongs to the value and not to the column**, which is the thing to know before
+// reading one. A column's declared type is an affinity rather than a promise, so a column declared
+// `INTEGER` hands back a `TEXT` value where text was stored -- and a reader that wants to know what it
+// is holding asks this rather than the schema.
+//
+// `SQLITE_NULL` is spelled `NULL_TYPE` here because a reader meeting `NULL` beside a file full of
+// pointers would take it for one. It is the number 5.
+c const
+    INTEGER: int   = "SQLITE_INTEGER"
+    FLOAT: int     = "SQLITE_FLOAT"
+    TEXT: int      = "SQLITE_TEXT"
+    BLOB: int      = "SQLITE_BLOB"
+    NULL_TYPE: int = "SQLITE_NULL"
+
 // Opening and closing a connection, and the message the connection is carrying.
 //
 // `errmsg` answers "out of memory" when it is handed a null connection, which is SQLite's own
@@ -92,6 +109,28 @@ extern "sqlite3_open_v2" open(path: *u8, db: **Sqlite3, flags: int, vfs: *u8) ->
 extern "sqlite3_close" close(db: *Sqlite3) -> int
 extern "sqlite3_errmsg" errmsg(db: *Sqlite3) -> *u8
 
+// What the connection itself has to say afterwards: the key the last insert was given, how many rows
+// the last statement touched, how long to wait on a lock before giving up, and whether a transaction
+// is open.
+//
+// A rowid is 64 bits, so it is a `long` rather than an `int` -- SQLite's own `sqlite3_int64`. `changes`
+// is an `int` because SQLite declares it as one; the 64-bit `sqlite3_changes64` is a newer symbol and
+// is deliberately not named here, since a statement touching more than two billion rows is not a case
+// this binding is buying a compatibility floor for.
+//
+// `get_autocommit` answers non-zero when the connection is in autocommit mode, which is to say when no
+// transaction is open -- so it reads inverted, and the layer above is where that is turned the right
+// way round.
+extern "sqlite3_last_insert_rowid" last_insert_rowid(db: *Sqlite3) -> long
+extern "sqlite3_changes" changes(db: *Sqlite3) -> int
+extern "sqlite3_busy_timeout" busy_timeout(db: *Sqlite3, ms: int) -> int
+extern "sqlite3_get_autocommit" get_autocommit(db: *Sqlite3) -> int
+
+// Whether this SQLite was built with a named option -- `"ENABLE_FTS5"`, `"THREADSAFE=1"`. The
+// `SQLITE_` prefix is optional and both spellings answer the same thing, which `tests.sysl` checks
+// rather than takes on trust.
+extern "sqlite3_compileoption_used" compileoption_used(name: *u8) -> int
+
 // Compiling a statement, running it, and releasing it. `prepare`'s last parameter is where SQLite
 // writes a pointer to whatever text is left over, which is the only way to reach the second statement
 // in one string.
@@ -100,16 +139,43 @@ extern "sqlite3_step" step(stmt: *Stmt) -> int
 extern "sqlite3_finalize" finalize(stmt: *Stmt) -> int
 extern "sqlite3_reset" reset(stmt: *Stmt) -> int
 
-// Reading the current row. The bytes `column_text` and `column_name` answer are SQLite's own and stay
-// valid only until the next step, so a caller copies them out rather than keeping the pointer.
+// Reading the current row. The bytes `column_text`, `column_blob` and `column_name` answer are
+// SQLite's own and stay valid only until the next step, so a caller copies them out rather than
+// keeping the pointer.
+//
+// **`column_bytes` is asked AFTER `column_blob`, not before**, and this is SQLite's own rule rather
+// than a preference. Either call may convert the value in place -- reading a number as a blob makes
+// its text -- and the length is only the length of what the *last* call produced. Asking for the size
+// first and the bytes second can therefore answer the size of something else.
+//
+// `column_decltype` answers the type the CREATE TABLE wrote for this column, and null for a column
+// that is an expression rather than a table's -- `SELECT count(*)` has no declared type because there
+// is no declaration to read.
 extern "sqlite3_column_count" column_count(stmt: *Stmt) -> int
+extern "sqlite3_column_type" column_type(stmt: *Stmt, col: int) -> int
 extern "sqlite3_column_int" column_int(stmt: *Stmt, col: int) -> int
+extern "sqlite3_column_int64" column_int64(stmt: *Stmt, col: int) -> long
+extern "sqlite3_column_double" column_double(stmt: *Stmt, col: int) -> real
 extern "sqlite3_column_text" column_text(stmt: *Stmt, col: int) -> *u8
+extern "sqlite3_column_blob" column_blob(stmt: *Stmt, col: int) -> *u8
+extern "sqlite3_column_bytes" column_bytes(stmt: *Stmt, col: int) -> int
 extern "sqlite3_column_name" column_name(stmt: *Stmt, col: int) -> *u8
+extern "sqlite3_column_decltype" column_decltype(stmt: *Stmt, col: int) -> *u8
 
 // Binding a parameter. SQLite numbers them from 1.
+//
+// `bind_parameter_count` is the largest index the statement has, which is what a caller filling a
+// statement from a list of values checks its length against rather than discovering one `SQLITE_RANGE`
+// at a time. `clear_bindings` sets every parameter back to NULL, which `reset` deliberately does not.
 extern "sqlite3_bind_int" bind_int(stmt: *Stmt, index: int, value: int) -> int
+extern "sqlite3_bind_int64" bind_int64(stmt: *Stmt, index: int, value: long) -> int
+extern "sqlite3_bind_double" bind_double(stmt: *Stmt, index: int, value: real) -> int
+extern "sqlite3_bind_null" bind_null(stmt: *Stmt, index: int) -> int
+extern "sqlite3_bind_parameter_count" bind_parameter_count(stmt: *Stmt) -> int
+extern "sqlite3_clear_bindings" clear_bindings(stmt: *Stmt) -> int
 
-// The one below is `shim.c`, not SQLite -- see that file for why `SQLITE_TRANSIENT` cannot be
-// spelled here at all. It is the one thing in the whole binding that C has to do on sysl's behalf.
+// The two below are `shim.c`, not SQLite -- see that file for why `SQLITE_TRANSIENT` cannot be
+// spelled here at all. They are the only things in the whole binding that C has to do on sysl's
+// behalf, and they are the two that hand SQLite bytes it has to keep.
 extern "sysl_sqlite_bind_text" bind_text(stmt: *Stmt, index: int, value: *u8) -> int
+extern "sysl_sqlite_bind_blob" bind_blob(stmt: *Stmt, index: int, value: *u8, n: int) -> int

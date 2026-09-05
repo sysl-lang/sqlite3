@@ -31,12 +31,12 @@ Name it in your project's `package.hocon` and `sysl build` fetches it:
 
 ```hocon
 dependencies {
-  sqlite3 { git = "github.com/sysl-lang/sqlite3", version = "0.6.0" }
+  sqlite3 { git = "github.com/sysl-lang/sqlite3", version = "0.7.0" }
 }
 ```
 
 The coordinate is an identity rather than a URL, so it carries no `https://`, and `version` is the
-tag `v0.6.0` here. Note that it names the **package**, `sqlite3`, while the module you import is
+tag `v0.7.0` here. Note that it names the **package**, `sqlite3`, while the module you import is
 `sh.sysl.sqlite` — those are deliberately different things.
 
 Or build the package into an artifact once, then compile against it:
@@ -155,6 +155,94 @@ from the header. `open` and `open_readonly` are the two names for the common cas
 `NULL` is the case a binding has to have an answer for, and it has one: reading a column that holds
 SQL NULL answers `Ok(None)`, which is not the same answer as a decode failure and does not
 dereference the null pointer SQLite hands back.
+
+## Values
+
+**SQLite has five storage classes and there is a `bind_` and an `_at` for each of them**, which is
+the whole of what a program with a value model of its own — a scripting language, a serializer, a
+row mapper — needs from a database:
+
+| storage class | bound with | read with |
+|---|---|---|
+| `SQLITE_INTEGER` | `bind_int`, `bind_long` | `int_at`, `long_at` |
+| `SQLITE_FLOAT` | `bind_real` | `real_at` |
+| `SQLITE_TEXT` | `bind_text` | `text_at` |
+| `SQLITE_BLOB` | `bind_blob` | `blob_at` |
+| `SQLITE_NULL` | `bind_null` | any of them — see below |
+
+`long` is there beside `int` because SQLite stores an integer in up to 64 bits and
+`sqlite3_column_int` keeps 32 of them; a rowid or a millisecond timestamp read through `int_at` comes
+back quietly truncated.
+
+**SQLite is dynamically typed, so the type belongs to the value and not to the column.** A column
+declared `INTEGER` holds whatever was put in it, and `q.type_at(col)` is what says which of the five
+arrived — per row, since two rows of one column may differ. `q.decltype_at(col)` is the other
+question: the type the `CREATE TABLE` declared, which is an affinity rather than a promise, and
+absent for a column that is an expression.
+
+**Every reader coerces rather than refusing, and this is the part most likely to be mistaken for a
+bug.** `int_at` on the text `"3.5"` is 3, on `"apple"` is 0, and on SQL NULL is 0; `text_at` on the
+integer 42 is `"42"`. Nothing reports a mismatch, because SQLite does not consider it one — so
+`type_at` is the only way to tell a stored zero from a stored `"apple"`, and a program that cares
+asks it before reading.
+
+```sysl
+val value = q.type_at(0) match
+    Integer -> Num(q.long_at(0))
+    Real    -> Num(q.real_at(0))
+    Text    -> Str(q.text_at(0)?.unwrap_or(""))
+    Blob    -> Bytes(q.blob_at(0).unwrap())
+    Null    -> Nil
+```
+
+**A blob is bytes and not text, and the difference is the zero byte.** `bind_blob` takes a
+`[]const u8` and `blob_at` answers an owned `Buf[u8]`, so bytes holding zeros — or anything that is
+not UTF-8 — go in and come back unchanged. An empty slice binds a *zero-length blob*, which is a
+value; SQL NULL is the absence of one, and `blob_at` answers `None` only for the second. Telling
+those two apart costs this binding a line at each end, because C's spelling of them is the same: a
+null pointer out of `sqlite3_column_blob` means either, and a null pointer *into* `sqlite3_bind_blob`
+means SQL NULL whatever the length says.
+
+**The connection has three things to say after a statement runs.** `db.last_insert_rowid()` is the
+key SQLite chose for the row just inserted, `db.changes()` is how many rows the last `INSERT`,
+`UPDATE` or `DELETE` touched — 0 for one that matched nothing, which is not an error and is invisible
+without asking — and `db.busy_timeout(ms)` is how long to wait on a lock before answering `Busy`.
+
+## Transactions
+
+`db.begin()`, `db.commit()` and `db.rollback()` are the three, and `db.in_transaction()` says whether
+one is open. They are what `exec_all` points at: a piece of SQL that fails part way through leaves
+what already ran run, and a transaction is what undoes it.
+
+```sysl
+db.begin()?
+
+for row in rows
+    val ok = insert(db, row)
+
+    if ok.is_err()
+        db.rollback()?
+        return ok
+
+db.commit()
+```
+
+SQLite has no nested transactions, so a second `begin` is refused with `Failed` rather than counted —
+ask `in_transaction` first where that is a possibility. The rollback path is the one a program
+forgets: a failure between `begin` and `commit` that simply returns leaves the transaction open,
+holding its locks, until the connection closes.
+
+## What this SQLite was built with
+
+SQLite is the machine's library rather than one this package carries, so what it can do is a property
+of the machine. `compiled_with("ENABLE_FTS5")` is how a program asks — the `SQLITE_` prefix is
+optional — and the alternative is finding out at the `CREATE VIRTUAL TABLE`, which fails with the
+unspecific code and the message "no such module: fts5".
+
+**FTS5 is present on macOS's own SQLite**, which the tests check rather than assume: they create a
+full-text table, match against it, and read `bm25()` and the hidden `rank` column with `real_at` —
+both are `SQLITE_FLOAT`, and both are negative, FTS5 ordering a better match first by making its
+score smaller.
 
 **Text holding more than one statement needs `statements` or `exec_all`.** SQLite's `prepare`
 compiles the *first* statement and hands back a pointer to what is left, so `prepare` and `exec` run
