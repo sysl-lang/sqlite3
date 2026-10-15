@@ -2,6 +2,8 @@
 
 A [sysl](https://github.com/sysl-lang/sysl) binding for SQLite.
 
+*An independent sysl package for SQLite. It is not affiliated with or endorsed by SQLite's authors or trademark holders.*
+
 The module is `sqlite`, and the directory it lives in is what names it — a module is a directory and
 its name is that directory's path relative to the package root. The C that sits beside it is part of
 the library: sysl compiles it as part of the build, so nothing here needs a makefile and there is no
