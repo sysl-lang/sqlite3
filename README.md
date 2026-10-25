@@ -14,7 +14,7 @@ sh/sysl/sqlite/
     sqlite.sysl     the binding a program calls
     c/c.sysl        the boundary as C declares it: the link, the header, the codes, the externs
     c/shim.c        the one call that needs C: `SQLITE_TRANSIENT` is a cast, not a value
-package.hocon       who this package is, and what it needs of the machine
+sysl.hocon          who this package is, and what it needs of the machine
 ```
 
 The module is **`sh.sysl.sqlite`**, and the three directories are that name: a dotted module name
@@ -29,16 +29,16 @@ reached yet can import the lower one and call it directly; that is what it is fo
 
 ## Using it
 
-Name it in your project's `package.hocon` and `sysl build` fetches it:
+Name it in your project's `sysl.hocon` and `sysl build` fetches it:
 
 ```hocon
 dependencies {
-  sqlite3 { git = "github.com/sysl-lang/sqlite3", version = "0.7.0" }
+  sqlite3 { git = "github.com/sysl-lang/sqlite3", version = "0.7.1" }
 }
 ```
 
 The coordinate is an identity rather than a URL, so it carries no `https://`, and `version` is the
-tag `v0.7.0` here. Note that it names the **package**, `sqlite3`, while the module you import is
+tag `v0.7.1` here. Note that it names the **package**, `sqlite3`, while the module you import is
 `sh.sysl.sqlite` — those are deliberately different things.
 
 Or build the package into an artifact once, then compile against it:
@@ -58,7 +58,7 @@ You will need SQLite's development files on the machine — `libsqlite3` and its
 a binding and not a copy. `c/c.sysl` says `@include("<sqlite3.h>")` and no copy of that header is in
 this repository.
 
-**Where they are is not your problem as of 0.6.1.** This package names SQLite in its `package.hocon`,
+**Where they are is not your problem as of 0.6.1.** This package names SQLite in its `sysl.hocon`,
 and the compiler asks `pkg-config` where it lives, so a build is just:
 
 ```
